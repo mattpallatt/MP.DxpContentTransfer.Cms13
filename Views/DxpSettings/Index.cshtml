@@ -1,0 +1,273 @@
+@model DxpContentTransfer.Cms13.Models.SettingsViewModel
+@{
+    Layout = null;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>DXP Content Transfer — Settings</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+
+        body {
+            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 14px;
+            line-height: 1.5;
+            margin: 0;
+            padding: 0;
+            color: #1a1a1a;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+
+        /* Top navigation bar — matches Optimizely admin chrome */
+        .admin-topbar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            height: 48px;
+            padding: 0 24px;
+            background: #0d1b34;
+            color: #fff;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .admin-topbar__back {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: rgba(255,255,255,0.75);
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 4px 10px;
+            border-radius: 4px;
+            transition: background 0.15s, color 0.15s;
+        }
+        .admin-topbar__back:hover {
+            background: rgba(255,255,255,0.12);
+            color: #fff;
+        }
+        .admin-topbar__back svg {
+            flex-shrink: 0;
+        }
+
+        .admin-topbar__divider {
+            width: 1px;
+            height: 20px;
+            background: rgba(255,255,255,0.2);
+        }
+
+        .admin-topbar__breadcrumb {
+            font-size: 13px;
+            color: rgba(255,255,255,0.5);
+        }
+
+        .admin-topbar__title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        /* Page content */
+        .page-content {
+            max-width: 760px;
+            margin: 32px auto;
+            padding: 0 24px;
+        }
+
+        .page-header {
+            margin-bottom: 24px;
+        }
+
+        h1 {
+            font-size: 22px;
+            font-weight: 600;
+            margin: 0 0 6px;
+            color: #1a1a1a;
+        }
+
+        .subtitle {
+            color: #666;
+            margin: 0;
+            font-size: 14px;
+        }
+
+        .alert {
+            padding: 10px 14px;
+            border-radius: 4px;
+            margin-bottom: 18px;
+            font-size: 14px;
+        }
+        .alert-success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
+        .alert-error   { background: #fdecea; color: #b71c1c; border: 1px solid #ef9a9a; }
+
+        fieldset {
+            background: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 16px 22px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+
+        legend {
+            font-size: 14px;
+            font-weight: 600;
+            padding: 0 6px;
+            color: #1a1a1a;
+        }
+
+        .field { margin-bottom: 14px; }
+        .field:last-child { margin-bottom: 0; }
+
+        .field label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            color: #444;
+            margin-bottom: 5px;
+        }
+
+        .field input {
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: inherit;
+            background: #fff;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .field input:focus {
+            outline: none;
+            border-color: #2973c3;
+            box-shadow: 0 0 0 2px rgba(41,115,195,0.2);
+        }
+
+        .actions { margin-top: 8px; }
+
+        .btn-save {
+            padding: 9px 24px;
+            background: #2973c3;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            font-family: inherit;
+            letter-spacing: 0.01em;
+            transition: background 0.15s;
+        }
+        .btn-save:hover { background: #1f5ea3; }
+        .btn-save:active { background: #164a82; }
+    </style>
+</head>
+<body>
+
+    <nav class="admin-topbar">
+        <a class="admin-topbar__back" href="javascript:history.back()">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M8.5 3L4.5 7L8.5 11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Back
+        </a>
+        <div class="admin-topbar__divider"></div>
+        <span class="admin-topbar__breadcrumb">Tools</span>
+        <span class="admin-topbar__breadcrumb">›</span>
+        <span class="admin-topbar__title">DXP Content Transfer</span>
+    </nav>
+
+    <div class="page-content">
+        <div class="page-header">
+            <h1>Settings</h1>
+            <p class="subtitle">
+                Configure OAuth2 client credentials for each DXP environment. These are used to obtain bearer tokens
+                for the Content Management API. Details for creating Keys and Secrets can be found on
+                <a href="https://docs.developers.optimizely.com/digital-experience-platform/v1.3.0-DXP-for-CMS11-COM13/docs/authentication" target="_blank">Optimizely's API Authentication Page</a>.
+            </p>
+        </div>
+
+        @if (Model.Saved)
+        {
+            <div class="alert alert-success">Settings saved successfully.</div>
+        }
+        @if (!string.IsNullOrWhiteSpace(Model.ErrorMessage))
+        {
+            <div class="alert alert-error">@Model.ErrorMessage</div>
+        }
+
+        <form method="post" action="/EPiServer/DxpContentTransfer/Admin/Settings">
+            @Html.AntiForgeryToken()
+
+            <fieldset>
+                <legend>Integration</legend>
+                <div class="field">
+                    <label for="IntegrationBaseUrl">Base URL</label>
+                    <input type="url" id="IntegrationBaseUrl" name="IntegrationBaseUrl"
+                           value="@Model.IntegrationBaseUrl" placeholder="https://integration.example.com" />
+                </div>
+                <div class="field">
+                    <label for="IntegrationClientKey">Client Key (client_id)</label>
+                    <input type="text" id="IntegrationClientKey" name="IntegrationClientKey"
+                           value="@Model.IntegrationClientKey" placeholder="client_id" autocomplete="off" />
+                </div>
+                <div class="field">
+                    <label for="IntegrationClientSecret">Client Secret</label>
+                    <input type="password" id="IntegrationClientSecret" name="IntegrationClientSecret"
+                           value="@Model.IntegrationClientSecret" autocomplete="new-password" />
+                </div>
+            </fieldset>
+
+            <fieldset>
+                <legend>Preproduction</legend>
+                <div class="field">
+                    <label for="PreproductionBaseUrl">Base URL</label>
+                    <input type="url" id="PreproductionBaseUrl" name="PreproductionBaseUrl"
+                           value="@Model.PreproductionBaseUrl" placeholder="https://preproduction.example.com" />
+                </div>
+                <div class="field">
+                    <label for="PreproductionClientKey">Client Key (client_id)</label>
+                    <input type="text" id="PreproductionClientKey" name="PreproductionClientKey"
+                           value="@Model.PreproductionClientKey" placeholder="client_id" autocomplete="off" />
+                </div>
+                <div class="field">
+                    <label for="PreproductionClientSecret">Client Secret</label>
+                    <input type="password" id="PreproductionClientSecret" name="PreproductionClientSecret"
+                           value="@Model.PreproductionClientSecret" autocomplete="new-password" />
+                </div>
+            </fieldset>
+
+            <fieldset>
+                <legend>Production</legend>
+                <div class="field">
+                    <label for="ProductionBaseUrl">Base URL</label>
+                    <input type="url" id="ProductionBaseUrl" name="ProductionBaseUrl"
+                           value="@Model.ProductionBaseUrl" placeholder="https://www.example.com" />
+                </div>
+                <div class="field">
+                    <label for="ProductionClientKey">Client Key (client_id)</label>
+                    <input type="text" id="ProductionClientKey" name="ProductionClientKey"
+                           value="@Model.ProductionClientKey" placeholder="client_id" autocomplete="off" />
+                </div>
+                <div class="field">
+                    <label for="ProductionClientSecret">Client Secret</label>
+                    <input type="password" id="ProductionClientSecret" name="ProductionClientSecret"
+                           value="@Model.ProductionClientSecret" autocomplete="new-password" />
+                </div>
+            </fieldset>
+
+            <div class="actions">
+                <button type="submit" class="btn-save">Save Settings</button>
+            </div>
+        </form>
+    </div>
+
+</body>
+</html>

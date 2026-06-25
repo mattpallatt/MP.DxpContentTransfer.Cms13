@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AddRazorSupportForMvc>true</AddRazorSupportForMvc>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>MP.DxpContentTransfer.Cms13</PackageId>
+    <Version>0.2.0</Version>
+    <Authors>Matt Pallatt</Authors>
+    <Description>An Optimizely CMS 13 gadget that lets editors push content between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar — no developer involvement required. (BETA - probably not ideal to be using on Production systems quite yet - except at your own risk).</Description>
+    <ProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</ProjectUrl>
+    <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="EPiServer.CMS.Core" Version="[13.0.0, 14.0.0)" />
+    <PackageReference Include="EPiServer.CMS.UI.Core" Version="[13.0.0, 14.0.0)" />
+  </ItemGroup>
+</Project>
