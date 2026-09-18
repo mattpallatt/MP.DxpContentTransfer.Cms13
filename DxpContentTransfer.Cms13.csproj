@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>MP.DxpContentTransfer.Cms13</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.0.3</Version>
     <Authors>Matt Pallatt</Authors>
     <Description>An Optimizely CMS 13 gadget that lets content editors push content (pages, blocks, images, etc.) between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar with no developer involvement required.</Description>
     <!--
