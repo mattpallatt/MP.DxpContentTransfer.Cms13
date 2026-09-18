@@ -740,6 +740,7 @@ var dxpTransfer = (function () {
 
     function startRowPolling(jobId, req) {
         lastChecked = 0;
+        var banner = document.getElementById('dxp-transfer-banner');
         pollTimer = setInterval(function () {
             fetch('/dxp-content-transfer/api/progress/' + jobId)
                 .then(function (r) { return r.ok ? r.json() : null; })
@@ -748,6 +749,24 @@ var dxpTransfer = (function () {
                     for (var i = lastChecked; i < data.completed && i < planRows.length; i++)
                         setRowDone(planRows[i]);
                     lastChecked = data.completed;
+
+                    // BUG FIX: a transfer can discover and process more items at runtime (nested
+                    // dependencies the lighter-weight pre-check plan never enumerated) than there
+                    // are rows to tick -- data.completed keeps climbing past planRows.length while
+                    // the job is still genuinely running. Previously nothing showed this: every
+                    // visible row hit ✓ well before the job actually finished, with the banner
+                    // still just saying "Transferring..." — confirmed live, a 430-page transfer's
+                    // rows all showed done while the job kept running for several more minutes,
+                    // with no way to tell it apart from actually being finished. Total itself is
+                    // only the plan's own estimate (not a hard ceiling), so this reports a running
+                    // count rather than a fraction that could go over 100%.
+                    if (banner && !data.done) {
+                        var msg = 'Transferring… (' + data.completed + ' item' + (data.completed === 1 ? '' : 's') + ' so far)';
+                        if (data.completed > data.total)
+                            msg += ' — touching more items than the plan estimated; still working';
+                        banner.textContent = msg;
+                    }
+
                     if (data.done) {
                         stopPolling();
                         plan = null;
