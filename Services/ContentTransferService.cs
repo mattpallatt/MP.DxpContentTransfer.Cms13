@@ -944,7 +944,7 @@ public class ContentTransferService : IContentTransferService
         {
             // No versions at all — a non-versionable container/folder. Just ensure it (and its
             // container chain) exists on target under the same key; nothing to write.
-            await EnsureContainerExistsAsync(targetGuid, source, target, new HashSet<Guid>());
+            await EnsureContainerExistsAsync(targetGuid, source, target, new HashSet<Guid>(), fallbackLocale);
             onItemComplete?.Invoke();
             return;
         }
@@ -1018,7 +1018,7 @@ public class ContentTransferService : IContentTransferService
         {
             // A dependency (block/media, or a top-level item with no resolvable parent at all) —
             // mirror its source container/folder chain, creating any missing link under the same key.
-            await EnsureContainerExistsAsync(containerGuid, source, target, new HashSet<Guid> { sourceGuid });
+            await EnsureContainerExistsAsync(containerGuid, source, target, new HashSet<Guid> { sourceGuid }, fallbackLocale);
             effectiveParent = containerGuid;
             useOwner = false;
         }
@@ -1121,7 +1121,8 @@ public class ContentTransferService : IContentTransferService
     // engine's URL-based EnsureGlobalAssetFolderPathAsync/EnsureContentParentAsync entirely — no
     // URL resolution needed at all when the target key is always known in advance.
     private async Task EnsureContainerExistsAsync(
-        Guid containerGuid, DxpEnvironmentConfig source, DxpEnvironmentConfig target, HashSet<Guid> seen)
+        Guid containerGuid, DxpEnvironmentConfig source, DxpEnvironmentConfig target, HashSet<Guid> seen,
+        string fallbackLocale = null)
     {
         if (!seen.Add(containerGuid)) return;
         if (await ExistsOnTargetAsync(containerGuid, target)) return;
@@ -1138,7 +1139,7 @@ public class ContentTransferService : IContentTransferService
         var contentType = ExtractStringField(nodeResp.Body, "contentType");
         Guid? grandparentGuid = TryExtractStringField(nodeResp.Body, "container", out var gp) && Guid.TryParseExact(gp, "N", out var gpg) ? gpg : null;
         if (grandparentGuid.HasValue && grandparentGuid.Value != Guid.Empty)
-            await EnsureContainerExistsAsync(grandparentGuid.Value, source, target, seen);
+            await EnsureContainerExistsAsync(grandparentGuid.Value, source, target, seen, fallbackLocale);
 
         // KNOWN GAP: if this container has no container/owner of its own (a true root-level
         // container, e.g. the site root itself), it can't be created via this path at all —
@@ -1164,10 +1165,18 @@ public class ContentTransferService : IContentTransferService
         if (versions.Count > 0)
         {
             var v = versions[0];
+            // A container/folder node's own version can come back with a null locale (there's
+            // simply no locale concept for it, same gap noted in ProcessReferencedDependenciesAsync)
+            // -- forwarding that straight through 400s the create ("The 'locale' field does not
+            // allow 'null' values"), which then cascades into every child that needs this container
+            // as its parent failing with "Unable to find a content item with the key" since it was
+            // never actually created. Fall back to the locale of whatever's transferring THIS
+            // container, same as the main content-write path does.
+            var locale = string.IsNullOrEmpty(v.Locale) ? fallbackLocale : v.Locale;
             createJson["initialVersion"] = new JsonObject
             {
                 ["displayName"] = v.DisplayName,
-                ["locale"] = v.Locale,
+                ["locale"] = locale,
                 ["properties"] = JsonNode.Parse(v.PropertiesJson)
             };
         }
