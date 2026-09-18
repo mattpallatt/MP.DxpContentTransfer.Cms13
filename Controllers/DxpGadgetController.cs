@@ -40,9 +40,10 @@ public class DxpGadgetController : Controller
         var contentId = Request.Query["id"].ToString();
         var settings = _settingsService.Get();
         var currentHost = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
-        var currentEnv = DetectCurrentEnvironment(settings, currentHost);
+        var currentConfig = settings.DetectByHost(currentHost);
+        var currentEnv = currentConfig?.Name;
 
-        var (contentName, isPage, isPublished) = ResolveContentInfo(contentId);
+        var (contentName, isPage, isPublished, languages) = ResolveContentInfo(contentId);
 
         var availableTargets = settings.AllEnvironments
             .Where(e => e.IsConfigured && !string.Equals(e.Name, currentEnv, StringComparison.OrdinalIgnoreCase))
@@ -56,51 +57,46 @@ public class DxpGadgetController : Controller
             AvailableTargets = availableTargets,
             IsSettingsConfigured = settings.AllEnvironments.Any(e => e.IsConfigured),
             IsPageContent = isPage,
-            IsPublished = isPublished
+            IsPublished = isPublished,
+            AvailableLanguages = languages
         };
 
         return View("~/Views/DxpGadget/Index.cshtml", model);
     }
 
-    private (string name, bool isPage, bool isPublished) ResolveContentInfo(string contentId)
+    private (string name, bool isPage, bool isPublished, List<LanguageOption> languages) ResolveContentInfo(string contentId)
     {
         if (string.IsNullOrWhiteSpace(contentId))
-            return ("(no page selected)", false, false);
+            return ("(no page selected)", false, false, new());
 
-        var parts = contentId.Split('_', ':');
-        if (!int.TryParse(parts[0], out var id))
-            return (contentId, false, false);
+        var reference = ContentReferenceParser.Parse(contentId);
+        if (ContentReference.IsNullOrEmpty(reference))
+            return (contentId, false, false, new());
 
         try
         {
-            var content = _contentLoader.Get<IContent>(new ContentReference(id));
+            var content = _contentLoader.Get<IContent>(reference);
             var isPage = content is PageData;
             var isPublished = !(content is IVersionable v) || v.Status == VersionStatus.Published;
-            return (content?.Name ?? contentId, isPage, isPublished);
+            var languages = new List<LanguageOption>();
+            if (content is ILocalizable loc && loc.ExistingLanguages != null)
+            {
+                var masterCode = loc.MasterLanguage?.Name;
+                foreach (var culture in loc.ExistingLanguages)
+                    languages.Add(new LanguageOption
+                    {
+                        Code = culture.Name,
+                        DisplayName = culture.EnglishName,
+                        IsMaster = string.Equals(culture.Name, masterCode, StringComparison.OrdinalIgnoreCase)
+                    });
+                // Pin the master language first so the picker lists it at the top.
+                languages = languages.OrderByDescending(l => l.IsMaster).ToList();
+            }
+            return (content?.Name ?? contentId, isPage, isPublished, languages);
         }
         catch
         {
-            return (contentId, false, false);
+            return (contentId, false, false, new());
         }
-    }
-
-    private static string DetectCurrentEnvironment(DxpTransferSettings settings, string currentHost)
-    {
-        if (string.IsNullOrWhiteSpace(currentHost))
-            return null;
-
-        foreach (var env in settings.AllEnvironments)
-        {
-            if (string.IsNullOrWhiteSpace(env.BaseUrl))
-                continue;
-
-            if (Uri.TryCreate(env.BaseUrl, UriKind.Absolute, out var uri) &&
-                string.Equals(uri.Host, currentHost, StringComparison.OrdinalIgnoreCase))
-            {
-                return env.Name;
-            }
-        }
-
-        return null;
     }
 }

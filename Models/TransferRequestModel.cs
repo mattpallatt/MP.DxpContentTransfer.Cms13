@@ -9,4 +9,7 @@ public class TransferRequestModel
     public string TransferStatus { get; set; } = "Published";
     public List<PreCheckItemResult> Plan { get; set; }
     public string JobId { get; set; }
+
+    // Locale codes the user chose to transfer. Null/empty = transfer every language each item has.
+    public List<string> SelectedLanguages { get; set; }
 }

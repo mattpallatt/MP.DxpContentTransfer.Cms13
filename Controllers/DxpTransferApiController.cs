@@ -59,8 +59,34 @@ public class DxpTransferApiController : ControllerBase
             request.ContentId,
             request.TargetEnvironment,
             request.IncludeChildren,
-            request.OverwriteMatchingIds);
+            request.OverwriteMatchingIds,
+            request.DestinationParentId,
+            request.DestinationParentName);
 
+        return Ok(result);
+    }
+
+    [HttpGet("destination-tree/root")]
+    public async Task<IActionResult> DestinationTreeRoot([FromQuery] string contentId, [FromQuery] string targetEnvironment)
+    {
+        if (string.IsNullOrWhiteSpace(contentId) || string.IsNullOrWhiteSpace(targetEnvironment))
+            return BadRequest(new DestinationTreeRootResult { Success = false, ErrorMessage = "contentId and targetEnvironment are required." });
+
+        using var scope = _scopeFactory.CreateScope();
+        var transferService = scope.ServiceProvider.GetRequiredService<IContentTransferService>();
+        var result = await transferService.GetDestinationTreeRootAsync(contentId, targetEnvironment);
+        return Ok(result);
+    }
+
+    [HttpGet("destination-tree/children")]
+    public async Task<IActionResult> DestinationTreeChildren([FromQuery] string targetEnvironment, [FromQuery] string containerKey, [FromQuery] string locale)
+    {
+        if (string.IsNullOrWhiteSpace(targetEnvironment) || string.IsNullOrWhiteSpace(containerKey))
+            return BadRequest(new DestinationTreeChildrenResult { Success = false, ErrorMessage = "targetEnvironment and containerKey are required." });
+
+        using var scope = _scopeFactory.CreateScope();
+        var transferService = scope.ServiceProvider.GetRequiredService<IContentTransferService>();
+        var result = await transferService.ListDestinationChildrenAsync(targetEnvironment, containerKey, locale);
         return Ok(result);
     }
 
@@ -93,7 +119,11 @@ public class DxpTransferApiController : ControllerBase
                     sourceEnvironmentName,
                     request.TransferStatus ?? "Published",
                     request.Plan,
-                    onItemComplete: () => Interlocked.Increment(ref job.Completed));
+                    onItemComplete: () => Interlocked.Increment(ref job.Completed),
+                    // Pass the selection through verbatim: null = transfer all languages (no picker / not
+                    // sent), a non-empty list = those branches, an empty list = master language only. The
+                    // master always transfers regardless; the list only narrows the extra branches.
+                    selectedLanguages: request.SelectedLanguages);
                 job.Result = result;
             }
             catch (Exception ex)
@@ -138,28 +168,22 @@ public class DxpTransferApiController : ControllerBase
         return plan.Sum(p => 1 + CountNodes(p.Dependencies));
     }
 
+    // BUG FIX: a "Page" dependency node is tracked/displayed only — ContentTransferService's
+    // ProcessReferencedDependenciesAsync explicitly skips transferring page references (they're
+    // reported in the plan so the editor can see them, but nothing is ever created/updated for
+    // them), so it never calls onItemComplete for one. Counting them here inflated Total past the
+    // number of completions that could ever actually happen, so Completed could never catch up
+    // during the real work and the client's row polling (which walks planRows by completed-count)
+    // stalled until the final catch-all marked everything at once.
     private static int CountNodes(List<DependencyNode> nodes)
     {
         if (nodes == null) return 0;
-        return nodes.Sum(n => 1 + CountNodes(n.Children));
+        return nodes.Sum(n => (n.NodeType == "Page" ? 0 : 1) + CountNodes(n.Children));
     }
 
     private string DetectSourceEnvironment()
     {
         var host = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
-        var settings = _settingsService.Get();
-        var envs = new[] {
-            ("integration", settings.Integration),
-            ("preproduction", settings.Preproduction),
-            ("production", settings.Production)
-        };
-        foreach (var (name, config) in envs)
-        {
-            if (config?.IsConfigured != true) continue;
-            if (Uri.TryCreate(config.BaseUrl, UriKind.Absolute, out var uri) &&
-                string.Equals(uri.Host, host, StringComparison.OrdinalIgnoreCase))
-                return name;
-        }
-        return null;
+        return _settingsService.Get().DetectByHost(host)?.Name;
     }
 }

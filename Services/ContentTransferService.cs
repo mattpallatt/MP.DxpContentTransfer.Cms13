@@ -1,55 +1,133 @@
-using System.Net.Http.Headers;
-using System.Text;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Threading;
 using DxpContentTransfer.Cms13.Models;
 using EPiServer;
 using EPiServer.Core;
+using EPiServer.Core.Html.StringParsing;
+using EPiServer.DataAbstraction;
 using EPiServer.SpecializedProperties;
 using EPiServer.Web;
 using EPiServer.Web.Routing;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using static DxpContentTransfer.Cms13.Services.JsonVisitors;
 
 namespace DxpContentTransfer.Cms13.Services;
 
+// ── CMA → new CMS 13 REST API (/_cms/v1) port ────────────────────────────────────────────────
+//
+// The old engine (CMA v3) is gone from history but its design intent survives here almost
+// entirely, because the new API's content model made most of its hardest problems disappear
+// rather than requiring a translation:
+//
+//   • KEY PRESERVATION replaces id injection. CMA needed the target's environment-specific
+//     integer id injected into every reference object (guidValue alone wasn't enough to bind a
+//     reference). The new API's references are self-contained "cms://content/{key}" URIs, and
+//     `key` is caller-suppliable on create (confirmed live: POST /_cms/v1/content with a chosen
+//     key, then GET it back by that same key — 201/200). So every item is created on the target
+//     using ITS SOURCE GUID (32-char lowercase hex, no dashes) as its key. A ContentArea or
+//     single-reference property copied verbatim from the source response is then ALREADY a
+//     valid reference on the target, with zero rewriting, PROVIDED the referenced item exists
+//     there under that same key — which the depth-first dependency walk below guarantees.
+//     This one fact deletes CMA's entire InjectTargetContentIds/GetTargetContentIdAsync/idMap
+//     machinery.
+//   • OWNER replaces the "For This Page/Block" folder probe. CMA exposed no way to discover a
+//     content's local-asset-folder GUID (it's generated per environment); the workaround was to
+//     PUT a throwaway 1×1 image to force Optimizely to create+route it, read the folder GUID off
+//     the probe's parentLink, delete the probe, and defer local BLOCKS (which Optimizely doesn't
+//     auto-route the way it does media) until a sibling media upload revealed the folder. The new
+//     API's `owner` field does this directly and uniformly for media AND blocks — confirmed live:
+//     a TeaserBlock created with owner=<pageKey> immediately appeared in that page's
+//     GET .../assets, exactly like pre-existing media. No probing, no deferral, no folder-mapping
+//     cache. This deletes ResolveAssetFolderGuidAsync/CaptureFolderMappingAsync/
+//     TransferDeferredLocalBlocksAsync/the ProbePng constant entirely.
+//   • CONTAINER-KEY PRESERVATION replaces URL-based folder-path resolution. CMA had no way to
+//     look up a folder by GUID chain, so global-asset folders (identified in markup only by
+//     path, e.g. /globalassets/events/) were found by walking the path segment-by-segment via
+//     the Content Delivery API's ?contentURL= lookup. CDAPI is gone entirely now (a confirmed,
+//     unfixable packaging conflict with /_cms/v1 — see CLAUDE.md), and the new REST API has no
+//     URL-to-key resolver at all (confirmed against the full documented endpoint family, not
+//     just the ones this file touches). But it turns out not to matter: a content's `container`
+//     is already a GUID, so the fix is the same key-preservation trick applied recursively —
+//     EnsureContainerExistsAsync walks the SOURCE container chain by key and creates any missing
+//     link on the target under that same key, no URL involved. This deletes
+//     EnsureGlobalAssetFolderPathAsync/FindByUrlAsync/FindByUrlOnTargetAsync/
+//     FindByUrlOnSourceAsync/GetTargetContentUrlViaCdvAsync/GetSourceContentUrlAsync.
+//   • Locale/invariant properties got SIMPLER, not harder. CMA rejected a branch write that
+//     included culture-invariant properties (409), so every non-master language had to be
+//     filtered down to only PropertyDefinition.LanguageSpecific properties before writing
+//     (LanguagePlan.CultureSpecificByType). Confirmed live: the new API has no such rule — a
+//     version write for ANY locale must include the type's required properties (invariant ones
+//     too), and resending the same invariant value every time succeeds cleanly (201, no
+//     conflict). So every locale write here just sends the SAME full property set read for that
+//     locale. This deletes the whole CultureSpecificByType pre-load and the filtering step.
+//   • Non-versionable content needed NO special-casing verification. CMA's ContentNotVersionable
+//     retry (strip status/startPublish/stopPublish and re-PUT) doesn't have an analogue here: a
+//     non-versionable/container-type node simply has `locales: []` and no version to write in
+//     the first place (confirmed live) — the version-scoped write model makes the whole class of
+//     error structurally impossible rather than something to catch and retry.
+//
+// What did NOT get simpler, and is a real, permanent gap documented at the point it bites (grep
+// "KNOWN GAP" in this file): the new API exposes no numeric content-id concept at all, so the two
+// CMA-era numeric remaps baked into rich-text markup by the classic editor — the ",,{id}" suffix
+// on inline image src, and the integer data-contentlink on epi-contentfragment divs — cannot be
+// computed for the target and are left as-is (pointing at the SOURCE's numbers). And the
+// PreCheck-phase URL-based ancestor-matching fallback (for a target page that pre-exists under a
+// different GUID at the same conceptual URL, created by something other than this tool) is
+// dropped rather than reimplemented — it now falls through to the existing site-root safety net
+// instead. See CLAUDE.md for the full list.
 public class ContentTransferService : IContentTransferService
 {
     private readonly IDxpSettingsService _settingsService;
     private readonly IEnvironmentTokenService _tokenService;
-    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly CmsApiClient _api;
     private readonly IContentLoader _contentLoader;
     private readonly IUrlResolver _urlResolver;
+    private readonly IContentTypeRepository _contentTypeRepository;
     private readonly ILogger<ContentTransferService> _logger;
-    private readonly bool _logApiCalls;
+
+    // A single write can require several retries as we strip properties the target rejects
+    // (unknown, or required-but-unsatisfiable) one at a time off the body; this bounds that loop.
+    private const int MaxWriteAttempts = 25;
+
+    private const string BuildMarker = "1.0.0-rest-api (transfer-only)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,
         IEnvironmentTokenService tokenService,
-        IHttpClientFactory httpClientFactory,
+        CmsApiClient api,
         IContentLoader contentLoader,
         IUrlResolver urlResolver,
-        ILogger<ContentTransferService> logger,
-        IConfiguration configuration)
+        IContentTypeRepository contentTypeRepository,
+        ILogger<ContentTransferService> logger)
     {
         _settingsService = settingsService;
         _tokenService = tokenService;
-        _httpClientFactory = httpClientFactory;
+        _api = api;
         _contentLoader = contentLoader;
         _urlResolver = urlResolver;
+        _contentTypeRepository = contentTypeRepository;
         _logger = logger;
-        _logApiCalls = configuration.GetValue<bool>("DxpContentTransfer:LogApiCalls");
     }
 
     // ── Pre-check ─────────────────────────────────────────────────────────────
+    // This whole phase reads only LOCAL content (IContentLoader/IUrlResolver, DB-backed, thread-
+    // affine) to build the plan shown to the editor. It is unchanged in spirit from the CMA-era
+    // engine — the only wire-format-dependent pieces are ExistsOnTargetAsync and
+    // ResolveTargetParentAsync's phase 1, both updated below to call the new API.
 
     public async Task<PreCheckResult> PreCheckAsync(
         string contentId,
         string targetEnvironmentName,
         bool includeChildren,
-        bool overwriteMatchingIds)
+        bool overwriteMatchingIds,
+        string destinationParentId = null,
+        string destinationParentName = null)
     {
+        var destinationOverrideGuid = !string.IsNullOrEmpty(destinationParentId) && Guid.TryParseExact(destinationParentId, "N", out var dpg) ? dpg : (Guid?)null;
+        _logger.LogInformation("DXP Content Transfer pre-check — build {Build}", BuildMarker);
         var settings = _settingsService.Get();
         var target = ResolveEnvironment(settings, targetEnvironmentName);
 
@@ -63,8 +141,6 @@ public class ContentTransferService : IContentTransferService
         // Pre-load ALL IContentLoader/IUrlResolver data synchronously BEFORE the first await.
         // IDatabaseExecutor is not thread-safe; any await can resume on a different thread pool thread.
         var batchGuidMap = new Dictionary<Guid, Guid>();
-        // Source GUIDs of batch items whose action is not Overwrite (i.e. being created fresh).
-        // Any descendant of these must also be created fresh, even if its GUID exists elsewhere on target.
         var batchForcedNew = new HashSet<Guid>();
         var depSeen = new HashSet<Guid>();
         var (siteRootGuid, siteRootPath) = GetSiteRootFallback();
@@ -74,7 +150,7 @@ public class ContentTransferService : IContentTransferService
             {
                 IContent content = null;
                 try { if (!ContentReference.IsNullOrEmpty(itemRef)) content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
-                catch { }
+                catch (Exception ex) { _logger.LogDebug("Pre-check: could not load content {Ref}: {Error}", itemRef, ex.Message); }
 
                 Guid? directParentSourceGuid = null;
                 string directParentName = null;
@@ -86,12 +162,11 @@ public class ContentTransferService : IContentTransferService
                         directParentSourceGuid = parent.ContentGuid;
                         directParentName = parent.Name;
                     }
-                    catch { }
+                    catch (Exception ex) { _logger.LogDebug("Pre-check: could not load parent of {Ref}: {Error}", itemRef, ex.Message); }
                 }
 
                 var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
                 if (content != null)
-                {
                     foreach (var a in BuildAncestorChain(content.ParentLink))
                     {
                         string url = null;
@@ -99,7 +174,6 @@ public class ContentTransferService : IContentTransferService
                         catch { }
                         ancestorsWithUrls.Add((a, url));
                     }
-                }
 
                 var deps = new List<DependencyNode>();
                 if (content is PageData)
@@ -112,32 +186,49 @@ public class ContentTransferService : IContentTransferService
             })
             .ToList();
 
+        var availableLanguages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ctx in itemContexts)
+            if (ctx.content is ILocalizable localizable && localizable.ExistingLanguages != null)
+                foreach (var culture in localizable.ExistingLanguages)
+                    if (culture != null && !string.IsNullOrEmpty(culture.Name))
+                        availableLanguages[culture.Name] = culture.EnglishName;
+
         // All IContentLoader work done — now safe to await.
         string targetToken;
         try { targetToken = await _tokenService.GetTokenAsync(target); }
         catch (Exception ex) { return new PreCheckResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
 
-        var result = new PreCheckResult { Success = true };
-
-        foreach (var (itemRef, content, directParentSourceGuid, directParentName, ancestorsWithUrls, deps) in itemContexts)
+        var result = new PreCheckResult
         {
+            Success = true,
+            AvailableLanguages = availableLanguages
+                .OrderBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => new LanguageOption { Code = kv.Key, DisplayName = kv.Value })
+                .ToList()
+        };
+
+        for (var idx = 0; idx < itemContexts.Count; idx++)
+        {
+            var (itemRef, content, directParentSourceGuid, directParentName, ancestorsWithUrls, deps) = itemContexts[idx];
+            // The "Place Under" override from the destination-tree picker applies only to the
+            // top-level item being transferred (index 0 — CollectItems always returns the
+            // requested root first, then its descendants). Descendants keep resolving their
+            // placement via batchGuidMap against their own direct parent, which already preserves
+            // the source structure underneath wherever the root ends up — no override needed there.
             var item = await BuildPreCheckItemAsync(
                 itemRef, content,
                 directParentSourceGuid, directParentName, ancestorsWithUrls,
                 siteRootGuid, siteRootPath,
-                target, targetToken, overwriteMatchingIds, batchGuidMap, batchForcedNew);
+                target, targetToken, overwriteMatchingIds, batchGuidMap, batchForcedNew,
+                idx == 0 ? destinationOverrideGuid : null, idx == 0 ? destinationParentName : null);
 
             item.Dependencies = deps;
             result.Items.Add(item);
 
             if (item.ContentGuid != Guid.Empty)
             {
-                var targetGuid = item.Action == PreCheckAction.CreateNew
-                    ? (item.NewGuid ?? item.ContentGuid)
-                    : item.ContentGuid;
+                var targetGuid = item.Action == PreCheckAction.CreateNew ? (item.NewGuid ?? item.ContentGuid) : item.ContentGuid;
                 batchGuidMap[item.ContentGuid] = targetGuid;
-
-                // Not an in-place overwrite → children cannot exist in context on the target
                 if (item.Action != PreCheckAction.Overwrite)
                     batchForcedNew.Add(item.ContentGuid);
             }
@@ -147,9 +238,8 @@ public class ContentTransferService : IContentTransferService
     }
 
     // Scans a page, block, or inline PropertyBlock's properties to build the nested dependency
-    // tree shown in the plan. Accepts IContentData so it can recurse into PropertyBlock values
-    // (inline blocks have no GUID and don't implement IContent).
-    // Uses IContentLoader (local, fast) so no API calls needed at pre-check time.
+    // tree shown in the plan. Unchanged from the CMA-era engine — entirely local (IContentLoader),
+    // no wire format involved.
     private List<DependencyNode> ScanContentDependencies(IContentData contentData, HashSet<Guid> seen)
     {
         var nodes = new List<DependencyNode>();
@@ -167,13 +257,9 @@ public class ContentTransferService : IContentTransferService
                         var child = _contentLoader.Get<IContent>(areaItem.ContentLink, LanguageSelector.AutoDetect(true));
                         if (!seen.Add(child.ContentGuid)) continue;
                         if (child is IContentMedia)
-                        {
                             nodes.Add(new DependencyNode { Name = child.Name, NodeType = GetMediaNodeType(child.Name), ContentGuid = child.ContentGuid.ToString("D") });
-                        }
                         else if (child is PageData)
-                        {
                             nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Page", ContentGuid = child.ContentGuid.ToString("D") });
-                        }
                         else
                         {
                             var blockNode = new DependencyNode { Name = child.Name, NodeType = "Block", ContentGuid = child.ContentGuid.ToString("D") };
@@ -218,61 +304,50 @@ public class ContentTransferService : IContentTransferService
             }
             else if (prop.Value is BlockData inlineBlock)
             {
-                // PropertyBlock — inline block embedded directly in the property (no separate GUID).
-                // Recurse to surface any media or content refs it contains.
-                try
-                {
-                    var innerNodes = ScanContentDependencies(inlineBlock, seen);
-                    nodes.AddRange(innerNodes);
-                }
+                try { nodes.AddRange(ScanContentDependencies(inlineBlock, seen)); }
                 catch { }
             }
         }
 
-        // Scan XHTML properties for actually-referenced inline images.
-        // Use type-name detection + PropertyLongString.LongString to get the raw stored XHTML
-        // without requiring an HTTP context (which XhtmlString.ToHtmlString() may need).
         var seenInlineUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var contentName = (contentData as IContent)?.Name ?? "inline block";
-        _logger.LogDebug("Pre-check XHTML scan for '{Content}': scanning {Count} properties", contentName, contentData.Property.Count);
         foreach (var prop in contentData.Property)
         {
             var typeName = prop.GetType().Name;
             if (!typeName.Contains("Xhtml", StringComparison.OrdinalIgnoreCase)) continue;
 
+            var xhtml = prop.Value as XhtmlString;
             string html = null;
             try
             {
-                // Try value cast first
-                if (prop.Value is XhtmlString xs)
-                    html = xs.ToString();
-                // Fallback: ToString() on the property itself (PropertyData.ToString() calls Value.ToString())
-                if (string.IsNullOrEmpty(html))
-                    html = prop.Value?.ToString();
-                // Last resort: use reflection to read the underlying string field
+                if (xhtml != null) html = xhtml.ToString();
+                if (string.IsNullOrEmpty(html)) html = prop.Value?.ToString();
                 if (string.IsNullOrEmpty(html))
                 {
-                    var field = prop.GetType().GetField("_longString",
-                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var field = prop.GetType().GetField("_longString", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                     html = field?.GetValue(prop) as string;
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogDebug("Pre-check XHTML read failed for '{Content}'.{Prop}({Type}): {Error}", contentName, prop.Name, typeName, ex.Message);
-            }
+            catch (Exception ex) { _logger.LogDebug("Pre-check XHTML read failed for '{Content}'.{Prop}({Type}): {Error}", contentName, prop.Name, typeName, ex.Message); }
 
-            _logger.LogDebug("Pre-check XHTML prop '{Content}'.{Prop}({Type}): {Len} chars", contentName, prop.Name, typeName, html?.Length ?? -1);
+            if (xhtml != null)
+                foreach (var fragment in xhtml.Fragments)
+                {
+                    if (fragment is not ContentFragment cf || cf.ContentGuid == Guid.Empty) continue;
+                    if (!seenInlineUrls.Add("frag:" + cf.ContentGuid.ToString("D"))) continue;
+                    string fragName = null;
+                    try { fragName = cf.GetContent()?.Name; } catch { }
+                    nodes.Add(new DependencyNode { Name = fragName ?? cf.ContentGuid.ToString("D"), NodeType = "InlineBlock", ContentGuid = cf.ContentGuid.ToString("D") });
+                }
+
             if (string.IsNullOrEmpty(html)) continue;
 
-            foreach (Match m in Regex.Matches(html, @"src=""([^""]+)""", RegexOptions.IgnoreCase))
+            foreach (Match m in Regex.Matches(html, @"(?:src|href)=""([^""]+)""", RegexOptions.IgnoreCase))
             {
                 var src = m.Groups[1].Value;
                 var srcPath = src.Split('?')[0];
 
-                // EPiServer permanent link format: /link/{32hex}.aspx
-                if (srcPath.StartsWith("/link/", StringComparison.OrdinalIgnoreCase) &&
-                    srcPath.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase))
+                if (srcPath.StartsWith("/link/", StringComparison.OrdinalIgnoreCase) && srcPath.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase))
                 {
                     if (!seenInlineUrls.Add(srcPath)) continue;
                     try
@@ -286,8 +361,8 @@ public class ContentTransferService : IContentTransferService
                 }
 
                 if (!src.Contains("/contentassets/", StringComparison.OrdinalIgnoreCase) &&
-                    !src.Contains("/globalassets/",  StringComparison.OrdinalIgnoreCase) &&
-                    !src.Contains("/EPiServer/",     StringComparison.OrdinalIgnoreCase))
+                    !src.Contains("/globalassets/", StringComparison.OrdinalIgnoreCase) &&
+                    !src.Contains("/EPiServer/", StringComparison.OrdinalIgnoreCase))
                     continue;
                 if (!seenInlineUrls.Add(srcPath)) continue;
                 var filename = Path.GetFileName(srcPath.TrimEnd('/'));
@@ -313,49 +388,39 @@ public class ContentTransferService : IContentTransferService
         string targetToken,
         bool overwriteMatchingIds,
         Dictionary<Guid, Guid> batchGuidMap,
-        HashSet<Guid> batchForcedNew)
+        HashSet<Guid> batchForcedNew,
+        Guid? destinationOverrideGuid = null,
+        string destinationOverrideName = null)
     {
         if (content == null)
-        {
-            return new PreCheckItemResult
-            {
-                ContentId = contentRef.ToString(),
-                ContentName = "?",
-                Action = PreCheckAction.Unresolvable,
-                Notes = "Could not load source content."
-            };
-        }
+            return new PreCheckItemResult { ContentId = contentRef.ToString(), ContentName = "?", Action = PreCheckAction.Unresolvable, Notes = "Could not load source content." };
 
         var guid = content.ContentGuid;
         var name = content.Name;
 
-        // All IContentLoader/IUrlResolver data was pre-loaded by the caller — safe to await immediately.
         var existsOnTarget = await ExistsOnTargetAsync(guid, target, targetToken);
 
-        // If the direct parent is in the batch and is being created fresh (not overwritten in-place),
-        // this item cannot exist on the target in the correct context — even if its GUID matches
-        // something elsewhere. Treat it as new so it gets created under its proper parent.
         if (existsOnTarget && directParentSourceGuid.HasValue && batchForcedNew.Contains(directParentSourceGuid.Value))
             existsOnTarget = false;
 
         if (existsOnTarget && overwriteMatchingIds)
-        {
             return new PreCheckItemResult
             {
-                ContentId = contentRef.ToString(),
-                ContentGuid = guid,
-                ContentName = name,
-                Action = PreCheckAction.Overwrite,
-                Notes = "Exists on target — will be overwritten in place."
+                ContentId = contentRef.ToString(), ContentGuid = guid, ContentName = name,
+                Action = PreCheckAction.Overwrite, Notes = "Exists on target — will be overwritten in place."
             };
+
+        Guid? parentGuid;
+        string parentPath;
+        if (destinationOverrideGuid.HasValue)
+        {
+            // Editor picked an explicit location in the destination-tree picker — takes priority
+            // over both automatic ancestor-matching and batch-sibling resolution. Only ever set for
+            // the top-level item (see PreCheckAsync); descendants never reach this branch.
+            parentGuid = destinationOverrideGuid;
+            parentPath = destinationOverrideName ?? "(selected location)";
         }
-
-        // Check the batch first: if the direct parent is also being transferred we know its target GUID
-        // without needing it to exist on target yet.
-        Guid? parentGuid = null;
-        string parentPath = null;
-
-        if (directParentSourceGuid.HasValue && batchGuidMap.TryGetValue(directParentSourceGuid.Value, out var batchParentTargetGuid))
+        else if (directParentSourceGuid.HasValue && batchGuidMap.TryGetValue(directParentSourceGuid.Value, out var batchParentTargetGuid))
         {
             parentGuid = batchParentTargetGuid;
             parentPath = (directParentName ?? "(parent being transferred)") + " (being transferred)";
@@ -365,97 +430,66 @@ public class ContentTransferService : IContentTransferService
             (parentGuid, parentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
         }
 
-        var usedRootFallback = false;
+        var isRootFallback = false;
         if (!parentGuid.HasValue)
         {
             parentGuid = siteRootGuid;
             parentPath = siteRootPath;
-            usedRootFallback = true;
+            isRootFallback = true;
         }
-
-        var isRootFallback = usedRootFallback;
 
         if (existsOnTarget)
-        {
             return new PreCheckItemResult
             {
-                ContentId = contentRef.ToString(),
-                ContentGuid = guid,
-                ContentName = name,
+                ContentId = contentRef.ToString(), ContentGuid = guid, ContentName = name,
                 Action = parentGuid.HasValue ? PreCheckAction.CreateNew : PreCheckAction.Unresolvable,
                 NewGuid = parentGuid.HasValue ? Guid.NewGuid() : null,
-                TargetParentGuid = parentGuid,
-                TargetParentPath = parentPath,
-                IsRootFallback = isRootFallback,
+                TargetParentGuid = parentGuid, TargetParentPath = parentPath, IsRootFallback = isRootFallback,
                 Notes = parentGuid.HasValue
-                    ? isRootFallback
-                        ? "Exists on target — overwrite off. Parent not found, will create as new copy under site root (unpublished)."
-                        : $"Exists on target — overwrite off, will create as new copy under '{parentPath}'."
+                    ? isRootFallback ? "Exists on target — overwrite off. Parent not found, will create as new copy under site root (unpublished)."
+                                     : $"Exists on target — overwrite off, will create as new copy under '{parentPath}'."
                     : "Exists on target — overwrite off, but parent could not be resolved on target."
             };
-        }
 
         return new PreCheckItemResult
         {
-            ContentId = contentRef.ToString(),
-            ContentGuid = guid,
-            ContentName = name,
+            ContentId = contentRef.ToString(), ContentGuid = guid, ContentName = name,
             Action = parentGuid.HasValue ? PreCheckAction.Create : PreCheckAction.Unresolvable,
-            TargetParentGuid = parentGuid,
-            TargetParentPath = parentPath,
-            IsRootFallback = isRootFallback,
+            TargetParentGuid = parentGuid, TargetParentPath = parentPath, IsRootFallback = isRootFallback,
             Notes = parentGuid.HasValue
-                ? isRootFallback
-                    ? "Does not exist on target and parent not found — will be created under site root (unpublished)."
-                    : $"Does not exist on target — will be created under '{parentPath}'."
+                ? isRootFallback ? "Does not exist on target and parent not found — will be created under site root (unpublished)."
+                                 : $"Does not exist on target — will be created under '{parentPath}'."
                 : "Does not exist on target and site root could not be resolved."
         };
     }
 
     private async Task<bool> ExistsOnTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (exists check)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (exists check)", url, (int)response.StatusCode, body);
-
-        // 401/403 means the content EXISTS but our identity can't read it — treat as present
-        if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
-            return true;
-
-        return response.StatusCode == System.Net.HttpStatusCode.OK;
+        var r = await _api.GetNodeAsync(target.BaseUrl, targetToken, ToKey(guid), "exists check");
+        // 401/403 means the content EXISTS but our identity can't read it — treat as present.
+        if (r.Status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return true;
+        return r.IsSuccess;
     }
 
+    // Phase 1 (GUID-based): walk up source ancestry, return the first that exists on target under
+    // the same key — unchanged from the CMA-era engine's intent.
+    //
+    // KNOWN GAP: the CMA-era phase 2 (URL-based ancestor matching, for a target page that
+    // pre-exists under a DIFFERENT guid at the same conceptual URL — e.g. content created
+    // directly on the target rather than by a prior transfer) is not reimplemented. CDAPI (the
+    // only thing that could resolve a URL to a key) is gone, and the new REST API has no URL
+    // resolver at all. Falling through to null here means the caller's site-root fallback kicks
+    // in instead of a URL match — content still gets created (under site root, unpublished)
+    // rather than silently lost, just not under the "right" pre-existing parent.
     private async Task<(Guid? guid, string path)> ResolveTargetParentAsync(
-        List<(IContent ancestor, string url)> ancestorsWithUrls,
-        DxpEnvironmentConfig target,
-        string targetToken)
+        List<(IContent ancestor, string url)> ancestorsWithUrls, DxpEnvironmentConfig target, string targetToken)
     {
-        // Phase 1: GUID-based — walk up source ancestry, return first that exists on target
         foreach (var (ancestor, _) in ancestorsWithUrls)
         {
             if (ancestor.ContentGuid == Guid.Empty) continue;
             if (await ExistsOnTargetAsync(ancestor.ContentGuid, target, targetToken))
                 return (ancestor.ContentGuid, ancestor.Name);
         }
-
-        // Phase 2: URL-based — URLs were pre-computed by the caller before any await
-        foreach (var (ancestor, relativeUrl) in ancestorsWithUrls)
-        {
-            if (string.IsNullOrWhiteSpace(relativeUrl) ||
-                relativeUrl == "/" ||
-                relativeUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var targetGuid = await FindByUrlOnTargetAsync(relativeUrl, target, targetToken);
-            if (targetGuid.HasValue)
-                return (targetGuid, $"{ancestor.Name} (matched by URL '{relativeUrl}')");
-        }
-
         return (null, null);
     }
 
@@ -464,10 +498,7 @@ public class ContentTransferService : IContentTransferService
         var chain = new List<IContent>();
         var current = startRef;
         var visited = new HashSet<int>();
-
-        while (!ContentReference.IsNullOrEmpty(current) &&
-               current.ID != ContentReference.RootPage.ID &&
-               visited.Add(current.ID))
+        while (!ContentReference.IsNullOrEmpty(current) && current.ID != ContentReference.RootPage.ID && visited.Add(current.ID))
         {
             try
             {
@@ -477,38 +508,241 @@ public class ContentTransferService : IContentTransferService
             }
             catch { break; }
         }
-
-        return chain; // nearest ancestor first
+        return chain;
     }
 
-    private async Task<Guid?> FindByUrlOnTargetAsync(string relativeUrl, DxpEnvironmentConfig target, string targetToken)
+    // ── Destination tree (manual "Place Under" picker) ──────────────────────────
+    // Ported from the nOCP SaaS content-transfer tool's target-directory picker. The new REST API
+    // has no URL resolver and ListItemsAsync's children carry no display name (see CmsApiClient's
+    // own doc comment), so both methods below lean on the same two primitives PreCheck already
+    // uses: ListItemsAsync for structural children, ListVersionsAsync per candidate for its name —
+    // the same N+1-per-expand cost nOCP's own implementation accepts for the identical reason.
+
+    // Root of the browsable tree is the true CMS root (see GetTreeRootFallback) — deliberately NOT
+    // the same node PreCheck's own automatic-placement fallback uses (that's the Start page, one
+    // level below this), since the tree needs to be able to show Start itself as a browsable/
+    // selectable node, not double as it.
+    public async Task<DestinationTreeRootResult> GetDestinationTreeRootAsync(string contentId, string targetEnvironmentName)
     {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/?contentURL={Uri.EscapeDataString(relativeUrl)}";
-        LogRequest("GET (URL lookup on target)", apiUrl, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        request.Headers.Add("Accept", "application/json");
-        var response = await client.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (URL lookup on target)", apiUrl, (int)response.StatusCode, json);
-        if (!response.IsSuccessStatusCode) return null;
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
+        var settings = _settingsService.Get();
+        var target = ResolveEnvironment(settings, targetEnvironmentName);
+        if (target == null || !target.IsConfigured)
+            return new DestinationTreeRootResult { Success = false, ErrorMessage = $"Target environment '{targetEnvironmentName}' is not configured." };
 
-        // Response may be a single object or an array
-        var element = root.ValueKind == JsonValueKind.Array
-            ? (root.GetArrayLength() > 0 ? root[0] : (JsonElement?)null)
-            : root;
+        var (siteRootGuid, siteRootPath) = GetTreeRootFallback();
+        if (!siteRootGuid.HasValue)
+            return new DestinationTreeRootResult { Success = false, ErrorMessage = "Could not resolve a site root to browse." };
 
-        if (element is null) return null;
+        // Local IContentLoader/IUrlResolver work first — same thread-affinity constraint as
+        // PreCheckAsync (IDatabaseExecutor is not thread-safe across an await).
+        var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
+        var contentRef = ParseContentReference(contentId);
+        if (contentRef != ContentReference.EmptyReference)
+        {
+            try
+            {
+                var content = _contentLoader.Get<IContent>(contentRef, LanguageSelector.AutoDetect(true));
+                foreach (var a in BuildAncestorChain(content.ParentLink))
+                {
+                    string url = null;
+                    try { url = _urlResolver.GetUrl(a.ContentLink); } catch { }
+                    ancestorsWithUrls.Add((a, url));
+                }
+            }
+            catch (Exception ex) { _logger.LogDebug("Destination tree root: could not load content {Ref}: {Error}", contentRef, ex.Message); }
+        }
 
-        if (element.Value.TryGetProperty("contentLink", out var cl) &&
-            cl.TryGetProperty("guidValue", out var guidProp) &&
-            Guid.TryParse(guidProp.GetString(), out var guid))
-            return guid;
+        string targetToken;
+        try { targetToken = await _tokenService.GetTokenAsync(target); }
+        catch (Exception ex) { return new DestinationTreeRootResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
 
-        return null;
+        var rootKey = ToKey(siteRootGuid.Value);
+        var rootNodeResp = await _api.GetNodeAsync(target.BaseUrl, targetToken, rootKey, "resolve destination tree root");
+        if (!rootNodeResp.IsSuccess)
+            return new DestinationTreeRootResult { Success = false, ErrorMessage = $"Site root does not exist on target yet: HTTP {(int)rootNodeResp.Status}" };
+
+        // BUG FIX: ResolveChildDisplayNameAsync used to just take versions[0].DisplayName — whichever
+        // locale the API happened to list first for that node, which is NOT necessarily the site's
+        // default language. Confirmed live: a tree mixing Russian/German/Swedish names on an English
+        // site. The first attempted fix (take the ROOT node's own `locales[0]`) regressed once the
+        // tree root moved from Start to the true CMS root (see GetTreeRootFallback) — the system
+        // "Root" node's own `locales` list isn't a real, master-first language list the way an actual
+        // page's is, so `[0]` came out arbitrary again (confirmed live: Russian). The right source was
+        // never any CONTENT's locale list at all — it's the language the current CMS user/editor is
+        // actually working in, which is what the editor actually expects the tree to show. Every name
+        // lookup in this tree — root and all children — resolves in this ONE locale.
+        var defaultLocale = EPiServer.Globalization.ContentLanguage.PreferredCulture?.Name
+            ?? System.Globalization.CultureInfo.CurrentUICulture.Name;
+
+        var result = new DestinationTreeRootResult
+        {
+            Success = true,
+            RootKey = rootKey,
+            RootName = await ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, rootKey, defaultLocale) ?? siteRootPath,
+            DefaultLocale = defaultLocale
+        };
+
+        var (defaultParentGuid, defaultParentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
+        if (defaultParentGuid.HasValue)
+        {
+            // BUG FIX: ResolveTargetParentAsync returns the SOURCE ancestor's own name (it's built
+            // for PreCheck's plan notes, "will be created under 'X'", describing the match in terms
+            // of the source content) — not whatever that node is actually called on the target under
+            // its preserved key. Confirmed live: source had since renamed the page to "Alloy TrackINGS"
+            // while the target's copy (created by an earlier transfer, before the rename) was still
+            // "Alloy Track" — the label said one thing, the tree highlighted a differently-named row
+            // for the exact same node, which read as if the picker had matched the wrong page
+            // entirely. Re-resolve the label from the TARGET's own version data so it always matches
+            // whatever the tree itself displays for that key.
+            var defaultParentKey = ToKey(defaultParentGuid.Value);
+            result.DefaultParentKey = defaultParentKey;
+            result.DefaultParentName = await ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, defaultParentKey, defaultLocale) ?? defaultParentPath;
+            result.ExpandPath = await BuildDestinationExpandPathAsync(target, targetToken, defaultParentGuid.Value, rootKey);
+        }
+        else
+        {
+            // No source ancestor exists on target under the same key — same case PreCheck's own
+            // site-root fallback covers. The predicted location is the root itself.
+            result.DefaultParentKey = rootKey;
+            result.DefaultParentName = result.RootName;
+            result.ExpandPath = new List<string> { rootKey };
+        }
+
+        // PERF: originally lazy (fetch one level per expand click) — confirmed live to feel slow
+        // even on a small site, since every expand costs a ListItemsAsync plus one ListVersionsAsync
+        // per child just for its name. Preloading the whole tree once here means expand/collapse in
+        // the client becomes a pure local state toggle with zero further round-trips. Bounded by
+        // MaxDestinationTreeNodes so a large/deep site can't turn one gadget load into thousands of
+        // requests; ListDestinationChildrenAsync (the old per-level endpoint) is left in place for a
+        // future hybrid fallback if that cap ever needs to matter in practice.
+        var budget = new TreeBudget { Remaining = MaxDestinationTreeNodes };
+        var children = await BuildDestinationSubtreeAsync(target, targetToken, rootKey, defaultLocale, 1, budget);
+        result.Tree = new DestinationTreeNode { Key = rootKey, Name = result.RootName, Children = children };
+        result.Truncated = budget.Remaining <= 0;
+
+        return result;
+    }
+
+    private const int MaxDestinationTreeNodes = 300;
+
+    private sealed class TreeBudget { public int Remaining; }
+
+    // Recursively fetches every descendant of containerKey (name + further children), fanning out
+    // in parallel at each level via Task.WhenAll — both the per-child name lookups and the recursive
+    // calls into grandchildren. `budget` is shared and decremented with Interlocked across the whole
+    // walk (concurrent branches decrement it concurrently) so the total node count across the ENTIRE
+    // tree stays bounded, not just per-level.
+    private async Task<List<DestinationTreeNode>> BuildDestinationSubtreeAsync(
+        DxpEnvironmentConfig target, string targetToken, string containerKey, string locale, int depth, TreeBudget budget)
+    {
+        if (depth > 20 || budget.Remaining <= 0) return new List<DestinationTreeNode>();
+
+        var itemsResp = await _api.ListItemsAsync(target.BaseUrl, targetToken, containerKey, "preload destination tree");
+        if (!itemsResp.IsSuccess) return new List<DestinationTreeNode>();
+
+        var nodes = new List<DestinationTreeNode>();
+        foreach (var key in ExtractItemKeys(itemsResp.Body))
+        {
+            if (Interlocked.Decrement(ref budget.Remaining) < 0) break;
+            nodes.Add(new DestinationTreeNode { Key = key });
+        }
+        if (nodes.Count == 0) return nodes;
+
+        var names = await Task.WhenAll(nodes.Select(n => ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, n.Key, locale)));
+        for (var i = 0; i < nodes.Count; i++)
+            nodes[i].Name = names[i] ?? nodes[i].Key;
+
+        var childSubtrees = await Task.WhenAll(nodes.Select(n => BuildDestinationSubtreeAsync(target, targetToken, n.Key, locale, depth + 1, budget)));
+        for (var i = 0; i < nodes.Count; i++)
+            nodes[i].Children = childSubtrees[i];
+
+        return nodes;
+    }
+
+    // Root-first chain of keys from the tree root down to (and including) targetGuid, by walking
+    // `container` back from targetGuid on the TARGET side. Lets the client auto-expand every
+    // ancestor of the predicted location in one shot instead of the editor clicking through each.
+    private async Task<List<string>> BuildDestinationExpandPathAsync(DxpEnvironmentConfig target, string targetToken, Guid targetGuid, string rootKey)
+    {
+        var chain = new List<string>();
+        var currentKey = ToKey(targetGuid);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (seen.Add(currentKey))
+        {
+            chain.Add(currentKey);
+            if (string.Equals(currentKey, rootKey, StringComparison.OrdinalIgnoreCase)) break;
+            var nodeResp = await _api.GetNodeAsync(target.BaseUrl, targetToken, currentKey, "walk destination ancestor chain");
+            if (!nodeResp.IsSuccess || !TryExtractStringField(nodeResp.Body, "container", out var containerKey)) break;
+            currentKey = containerKey;
+        }
+        chain.Reverse();
+        return chain;
+    }
+
+    public async Task<DestinationTreeChildrenResult> ListDestinationChildrenAsync(string targetEnvironmentName, string containerKey, string locale = null)
+    {
+        var settings = _settingsService.Get();
+        var target = ResolveEnvironment(settings, targetEnvironmentName);
+        if (target == null || !target.IsConfigured)
+            return new DestinationTreeChildrenResult { Success = false, ErrorMessage = $"Target environment '{targetEnvironmentName}' is not configured." };
+
+        string targetToken;
+        try { targetToken = await _tokenService.GetTokenAsync(target); }
+        catch (Exception ex) { return new DestinationTreeChildrenResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
+
+        var itemsResp = await _api.ListItemsAsync(target.BaseUrl, targetToken, containerKey, "list destination tree children");
+        if (!itemsResp.IsSuccess)
+            return new DestinationTreeChildrenResult { Success = false, ErrorMessage = $"Could not list children: HTTP {(int)itemsResp.Status}: {itemsResp.Body}" };
+
+        var childKeys = ExtractItemKeys(itemsResp.Body);
+        var names = await Task.WhenAll(childKeys.Select(k => ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, k, locale)));
+
+        var children = new List<DestinationTreeNode>();
+        for (var i = 0; i < childKeys.Count; i++)
+            children.Add(new DestinationTreeNode { Key = childKeys[i], Name = names[i] ?? childKeys[i] });
+
+        return new DestinationTreeChildrenResult { Success = true, Children = children };
+    }
+
+    // ListItemsAsync's children carry only key/container/owner/contentType — no displayName — so
+    // the friendly name needs a follow-up ListVersionsAsync per candidate (same limitation noted on
+    // CmsApiClient.ListItemsAsync itself). `locale` (the tree's resolved default, from
+    // GetDestinationTreeRootAsync) is requested directly so every node resolves its name in the
+    // SAME language rather than whichever locale the API lists first for that particular node. Falls
+    // back to the unfiltered first version if the node has no version in that locale at all (e.g. a
+    // page that was only ever translated into other languages), so a name still shows rather than
+    // nothing.
+    private async Task<string> ResolveChildDisplayNameAsync(string baseUrl, string token, string key, string locale)
+    {
+        if (!string.IsNullOrEmpty(locale))
+        {
+            var filtered = await _api.ListVersionsAsync(baseUrl, token, key, "resolve destination tree node name", locale);
+            if (filtered.IsSuccess)
+            {
+                var filteredVersions = ParseVersionList(filtered.Body);
+                if (filteredVersions.Count > 0) return filteredVersions[0].DisplayName;
+            }
+        }
+
+        var resp = await _api.ListVersionsAsync(baseUrl, token, key, "resolve destination tree node name (fallback — no version in default locale)");
+        if (!resp.IsSuccess) return null;
+        var versions = ParseVersionList(resp.Body);
+        return versions.Count > 0 ? versions[0].DisplayName : null;
+    }
+
+    private static List<string> ExtractItemKeys(string json)
+    {
+        var keys = new List<string>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                foreach (var item in items.EnumerateArray())
+                    if (item.TryGetProperty("key", out var k) && k.ValueKind == JsonValueKind.String)
+                        keys.Add(k.GetString());
+        }
+        catch { }
+        return keys;
     }
 
     // ── Transfer ──────────────────────────────────────────────────────────────
@@ -520,15 +754,16 @@ public class ContentTransferService : IContentTransferService
         string sourceEnvironmentName,
         string transferStatus = "Published",
         List<PreCheckItemResult> plan = null,
-        Action onItemComplete = null)
+        Action onItemComplete = null,
+        IReadOnlyCollection<string> selectedLanguages = null)
     {
+        _logger.LogInformation("DXP Content Transfer starting — build {Build}", BuildMarker);
         var settings = _settingsService.Get();
         var target = ResolveEnvironment(settings, targetEnvironmentName);
         var source = ResolveEnvironment(settings, sourceEnvironmentName);
 
         if (target == null || !target.IsConfigured)
             return new TransferResult { Success = false, ErrorMessage = $"Target environment '{targetEnvironmentName}' is not configured." };
-
         if (source == null || !source.IsConfigured)
             return new TransferResult { Success = false, ErrorMessage = $"Source environment '{sourceEnvironmentName}' is not configured. Ensure credentials are saved in settings." };
 
@@ -542,21 +777,15 @@ public class ContentTransferService : IContentTransferService
             {
                 IContent content = null;
                 try { content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
-                catch { }
+                catch (Exception ex) { _logger.LogDebug("Transfer: could not load content {Ref}: {Error}", itemRef, ex.Message); }
 
                 string contentName = null;
                 Guid sourceGuid = Guid.Empty;
-                int? sortIndex = null;
                 var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
-
                 if (content != null)
                 {
                     contentName = content.Name;
                     sourceGuid = content.ContentGuid;
-
-                    var psiVal = content.Property["PageSortIndex"]?.Value;
-                    if (psiVal != null) try { sortIndex = Convert.ToInt32(psiVal); } catch { }
-
                     foreach (var a in BuildAncestorChain(content.ParentLink))
                     {
                         string url = null;
@@ -565,10 +794,9 @@ public class ContentTransferService : IContentTransferService
                         ancestorsWithUrls.Add((a, url));
                     }
                 }
-
-                return (itemRef, content, contentName, sourceGuid, sortIndex, ancestorsWithUrls);
+                return (itemRef, content, contentName, sourceGuid, ancestorsWithUrls);
             })
-            .ToList(); // sortIndex is int? — null means "could not read", 0 is a valid explicit value
+            .ToList();
 
         // All IContentLoader work done — now safe to await.
         string targetToken;
@@ -579,126 +807,19 @@ public class ContentTransferService : IContentTransferService
         try { sourceToken = await _tokenService.GetTokenAsync(source); }
         catch (Exception ex) { return new TransferResult { Success = false, ErrorMessage = $"Failed to authenticate with source environment: {ex.Message}" }; }
 
-        var planLookup = plan?.ToDictionary(p => p.ContentId, StringComparer.OrdinalIgnoreCase)
-                         ?? new Dictionary<string, PreCheckItemResult>();
-
+        var planLookup = plan?.ToDictionary(p => p.ContentId, StringComparer.OrdinalIgnoreCase) ?? new Dictionary<string, PreCheckItemResult>();
         var result = new TransferResult { Success = true };
-
-        var deferredPatches = new List<(Guid guid, string property, string json)>();
+        var languageFilter = selectedLanguages == null ? null : new HashSet<string>(selectedLanguages, StringComparer.OrdinalIgnoreCase);
 
         foreach (var ctx in itemContexts)
         {
             planLookup.TryGetValue(ctx.itemRef.ToString(), out var planItem);
             var itemResult = await TransferSingleItemAsync(
-                ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid,
-                ctx.sortIndex, ctx.ancestorsWithUrls,
+                ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid, ctx.ancestorsWithUrls,
                 source.BaseUrl, sourceToken, target, targetToken,
-                planItem, transferStatus, onItemComplete, deferredPatches);
+                planItem, transferStatus, onItemComplete, languageFilter);
             result.Items.Add(itemResult);
-            if (!itemResult.Success)
-                result.Success = false;
-        }
-
-        // Second pass: re-apply any properties that were stripped because the referenced
-        // content did not yet exist on the target when the page was first written.
-        if (deferredPatches.Count > 0)
-        {
-            // Build a map from target GUID → result item so we can annotate defaults used.
-            var targetGuidToResult = new Dictionary<Guid, TransferItemResult>();
-            for (int i = 0; i < itemContexts.Count && i < result.Items.Count; i++)
-            {
-                var ctx = itemContexts[i];
-                var ri = result.Items[i];
-                if (!ri.Success) continue;
-                planLookup.TryGetValue(ctx.itemRef.ToString(), out var pi);
-                var tg = (pi?.Action == PreCheckAction.CreateNew) ? (pi.NewGuid ?? ctx.sourceGuid) : ctx.sourceGuid;
-                if (tg != Guid.Empty) targetGuidToResult[tg] = ri;
-            }
-
-            _logger.LogInformation("Applying {Count} deferred property patch(es) for forward content references", deferredPatches.Count);
-            foreach (var grp in deferredPatches.GroupBy(p => p.guid))
-            {
-                try
-                {
-                    var currentJson = await ReadFromTargetAsync(grp.Key, target, targetToken);
-                    if (currentJson == null)
-                    {
-                        _logger.LogWarning("Deferred patch: could not read {Guid} from target — skipping", grp.Key);
-                        continue;
-                    }
-                    var stripped = StripReadOnlyProperties(currentJson, preserveParentLink: true);
-                    var node = JsonNode.Parse(stripped)?.AsObject();
-                    if (node == null) continue;
-
-                    targetGuidToResult.TryGetValue(grp.Key, out var resultItem);
-                    var defaultsUsed = new List<string>();
-
-                    foreach (var (_, property, json) in grp)
-                    {
-                        // Check if the referenced content now exists on target
-                        var refGuid = ExtractReferencedContentGuid(json);
-                        var refExists = !refGuid.HasValue || await ExistsOnTargetAsync(refGuid.Value, target, targetToken);
-
-                        if (refExists)
-                        {
-                            try
-                            {
-                                // Inject target integer IDs for every GUID in this property so
-                                // Optimizely can resolve the reference. Without the integer id, a
-                                // GUID-only reference fails with InvalidContent even when the
-                                // content exists on target (EPiServer CMA v3 requirement).
-                                var patchJson = json;
-                                var patchGuids = ExtractContentReferenceGuids(json);
-                                if (patchGuids.Count > 0)
-                                {
-                                    var patchIdMap = new Dictionary<Guid, int?>();
-                                    foreach (var rg in patchGuids)
-                                    {
-                                        var tid = await GetTargetContentIdAsync(rg, target, targetToken);
-                                        if (tid.HasValue) patchIdMap[rg] = tid;
-                                    }
-                                    if (patchIdMap.Count > 0)
-                                        patchJson = InjectTargetContentIds(patchJson, patchIdMap);
-                                }
-                                node[property] = JsonNode.Parse(patchJson);
-                            }
-                            catch { _logger.LogWarning("Deferred patch: could not parse property '{Prop}' for {Guid}", property, grp.Key); }
-                        }
-                        else
-                        {
-                            // Referenced content still absent — create an automatic placeholder
-                            var fallbackGuid = await GetFallbackReferenceGuidAsync(
-                                json, refGuid, grp.Key, source.BaseUrl, sourceToken, target, targetToken);
-                            if (!string.IsNullOrEmpty(fallbackGuid))
-                            {
-                                var fallbackNode = BuildFallbackPropertyValue(json, fallbackGuid);
-                                if (fallbackNode != null)
-                                {
-                                    node[property] = fallbackNode;
-                                    defaultsUsed.Add(property);
-                                    _logger.LogDebug("Deferred patch: property '{Prop}' on {Guid} set to placeholder {Fallback}", property, grp.Key, fallbackGuid);
-                                }
-                            }
-                            else
-                            {
-                                _logger.LogWarning("Deferred patch: property '{Prop}' on {Guid} references missing content and no placeholder could be created — skipping", property, grp.Key);
-                            }
-                        }
-                    }
-
-                    var patchedContent = await RelinkContentLinksAsync(node.ToJsonString(), source.BaseUrl, target, targetToken);
-                    patchedContent = ReplaceSourceDomain(patchedContent, source.BaseUrl, target.BaseUrl);
-                    await WriteToTargetAsync(grp.Key, patchedContent, target, targetToken);
-                    _logger.LogInformation("Deferred patch applied for {Guid}: [{Props}]", grp.Key, string.Join(", ", grp.Select(p => p.property)));
-
-                    if (defaultsUsed.Count > 0 && resultItem != null)
-                        resultItem.DefaultedProperties.AddRange(defaultsUsed);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning("Deferred patch failed for {Guid}: {Error}", grp.Key, ex.Message);
-                }
-            }
+            if (!itemResult.Success) result.Success = false;
         }
 
         result.TransferredCount = result.Items.Count(i => i.Success);
@@ -706,47 +827,25 @@ public class ContentTransferService : IContentTransferService
     }
 
     private async Task<TransferItemResult> TransferSingleItemAsync(
-        ContentReference contentRef,
-        IContent content,
-        string contentName,
-        Guid sourceGuid,
-        int? sortIndex,
+        ContentReference contentRef, IContent content, string contentName, Guid sourceGuid,
         List<(IContent ancestor, string url)> ancestorsWithUrls,
-        string sourceBaseUrl,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken,
-        PreCheckItemResult planItem,
-        string transferStatus = "Published",
-        Action onItemComplete = null,
-        List<(Guid guid, string property, string json)> deferredPatches = null)
+        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        PreCheckItemResult planItem, string transferStatus, Action onItemComplete, HashSet<string> languageFilter)
     {
-        // content, contentName, sourceGuid, sortIndex, ancestorsWithUrls are all pre-loaded by caller.
         if (content == null)
             return new TransferItemResult { ContentId = contentRef.ToString(), Success = false, ErrorMessage = "Could not load content." };
 
-        string sourceJson;
-        try { sourceJson = await ReadFromSourceAsync(sourceGuid, sourceBaseUrl, sourceToken); }
-        catch (Exception ex)
-        {
-            return new TransferItemResult { ContentId = contentRef.ToString(), ContentName = contentName, Success = false, ErrorMessage = $"Failed to read from source: {ex.Message}" };
-        }
+        var targetGuid = (planItem?.Action == PreCheckAction.CreateNew) ? (planItem.NewGuid ??= Guid.NewGuid()) : sourceGuid;
 
-        // Determine target GUID (same as source unless this is a CreateNew scenario)
-        var targetGuid = (planItem?.Action == PreCheckAction.CreateNew)
-            ? (planItem.NewGuid ??= Guid.NewGuid())
-            : sourceGuid;
-
-        // Determine target parent GUID from plan; fall back to ancestry walk
         Guid targetParentGuid;
         if (planItem?.TargetParentGuid.HasValue == true)
-        {
             targetParentGuid = planItem.TargetParentGuid.Value;
-        }
         else if (planItem?.Action == PreCheckAction.Overwrite)
         {
-            // Overwrite: item already exists — extract its current parent from source
-            targetParentGuid = ExtractParentGuid(sourceJson) ?? Guid.Empty;
+            // Overwrite: item already exists — keep its current container/owner on target rather
+            // than re-deriving one, exactly as the CMA-era engine did.
+            var existingNode = await _api.GetNodeAsync(target.BaseUrl, targetToken, ToKey(sourceGuid), "read existing target parent");
+            targetParentGuid = existingNode.IsSuccess ? (ExtractGuidField(existingNode.Body, "container") ?? ExtractGuidField(existingNode.Body, "owner") ?? Guid.Empty) : Guid.Empty;
         }
         else
         {
@@ -759,19 +858,14 @@ public class ContentTransferService : IContentTransferService
 
         try
         {
-            var targetId = await TransferItemCoreAsync(
-                sourceGuid, sourceJson, sourceBaseUrl, sourceToken,
-                target, targetToken, targetGuid, targetParentGuid,
-                (transferStatus == "CheckedOut") ? "CheckedOut" : "Published",
-                visited, onItemComplete, sortIndex, deferredPatches, failedDependencyGuids);
+            var effectiveStatus = transferStatus == "CheckedOut" ? "CheckedOut" : "Published";
+            await TransferItemCoreAsync(sourceGuid, sourceBaseUrl, sourceToken, target, targetToken,
+                targetGuid, targetParentGuid, effectiveStatus, visited, onItemComplete, failedDependencyGuids, languageFilter);
 
             return new TransferItemResult
             {
-                ContentId = contentRef.ToString(),
-                ContentName = contentName,
-                Success = true,
-                TargetContentId = targetId,
-                TargetBaseUrl = target.BaseUrl,
+                ContentId = contentRef.ToString(), ContentName = contentName, Success = true,
+                TargetContentId = ToKey(targetGuid), TargetBaseUrl = target.BaseUrl,
                 FailedDependencyGuids = failedDependencyGuids
             };
         }
@@ -782,1758 +876,796 @@ public class ContentTransferService : IContentTransferService
         }
     }
 
-    // Core recursive transfer method — implements the stub → blocks → images → full cycle.
-    //
-    // Order of operations per item:
-    //   1. Write a minimal stub so Optimizely auto-creates the "For This Page/Block" asset folder
-    //   2. Recursively transfer every referenced block (depth-first) and upload standalone media
-    //   3. Upload inline images from PropertyXhtmlString fields (asset folder now exists)
-    //   4. Write the full content with correct XHTML URLs and injected target integer IDs
-    //
-    // This ordering guarantees that when we upload an inline image its parent asset folder
-    // already exists (created by the stub in step 1), so we can use the item's own GUID as
-    // the image parentLink without any pre-flight folder resolution.
-    private async Task<int?> TransferItemCoreAsync(
-        Guid sourceGuid,
-        string sourceJson,
-        string sourceBaseUrl,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken,
-        Guid targetGuid,
-        Guid targetParentGuid,
-        string effectiveStatus,
-        HashSet<Guid> visited,
-        Action onItemComplete,
-        int? sortIndex = null,
-        List<(Guid guid, string property, string json)> deferredPatches = null,
-        List<string> failedDependencyGuids = null)
+    // Core recursive transfer. Order of operations per item:
+    //   1. Read the source node + its default-locale version.
+    //   2. Recursively transfer every block/media this version's properties reference
+    //      (ContentArea items + single references + inline epi-contentfragment blocks),
+    //      depth-first, so they exist on the target before the parent references them.
+    //   3. Ensure the target container/owner chain exists (key-preserving; see
+    //      EnsureContainerExistsAsync).
+    //   4. Create (or add a new version to) the target item under that same key, with the
+    //      default-locale properties copied over — rewriting only inline-image src values that
+    //      need it (see RewriteInlineImagesAsync) — and a bounded strip-and-retry loop for
+    //      properties the target rejects.
+    //   5. Write every OTHER language this item has (subject to languageFilter) as an additional
+    //      version, same properties-copy logic, no shared/invariant filtering needed.
+    private async Task TransferItemCoreAsync(
+        Guid sourceGuid, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        Guid targetGuid, Guid targetParentGuid, string effectiveStatus,
+        HashSet<Guid> visited, Action onItemComplete, List<string> failedDependencyGuids, HashSet<string> languageFilter,
+        string fallbackLocale = null)
     {
-        // ── Step 1: Blocks and global media ──────────────────────────────────
-        // Process blocks depth-first (they must exist before the parent is written).
-        // Global media (not in contentassets) can also be uploaded now because their
-        // parent folder already exists on the target.
-        // Local media (contentassets images) are deferred until after step 2 creates
-        // the asset bucket for this item.
-        var idMap = new Dictionary<Guid, int?>();
-        var deferredLocalMedia = new List<(Guid guid, string json)>();
+        var sourceKey = ToKey(sourceGuid);
+        var nodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, sourceKey, "read source node");
+        if (!nodeResp.IsSuccess)
+            throw new HttpRequestException($"Could not read source node {sourceKey}: HTTP {(int)nodeResp.Status}: {nodeResp.Body}");
 
-        foreach (var refGuid in ExtractContentReferenceGuids(sourceJson))
+        var isOwned = TryExtractStringField(nodeResp.Body, "owner", out var sourceOwnerKey);
+        TryExtractStringField(nodeResp.Body, "container", out var sourceContainerKey);
+        var isContained = !isOwned && !string.IsNullOrEmpty(sourceContainerKey);
+        var contentType = ExtractStringField(nodeResp.Body, "contentType");
+
+        var versionsResp = await _api.ListVersionsAsync(sourceBaseUrl, sourceToken, sourceKey, "read source versions");
+        if (!versionsResp.IsSuccess)
+            throw new HttpRequestException($"Could not read source versions for {sourceKey}: HTTP {(int)versionsResp.Status}: {versionsResp.Body}");
+
+        var versions = ParseVersionList(versionsResp.Body);
+        if (versions.Count == 0)
         {
-            if (!visited.Add(refGuid))
-            {
-                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                if (tid.HasValue) idMap[refGuid] = tid;
-                continue;
-            }
-
-            string refJson;
-            try { refJson = await ReadFromSourceAsync(refGuid, sourceBaseUrl, sourceToken); }
-            catch { visited.Remove(refGuid); continue; }
-
-            bool isMedia, isBlock;
-            try
-            {
-                using var d = JsonDocument.Parse(refJson);
-                isMedia = IsMediaContent(d.RootElement);
-                isBlock = !isMedia && IsBlockContent(d.RootElement);
-            }
-            catch { continue; }
-
-            if (!isMedia && !isBlock)
-            {
-                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                if (tid.HasValue) idMap[refGuid] = tid;
-                continue;
-            }
-
-            if (isMedia)
-            {
-                if (IsLocalContent(refJson))
-                {
-                    // Asset bucket doesn't exist yet — defer until after step 2
-                    deferredLocalMedia.Add((refGuid, refJson));
-                }
-                else
-                {
-                    // Global media — ensure its parent folder exists on target before uploading.
-                    // Globalassets folder GUIDs are usually identical across DXP environments, but
-                    // sub-folders may be missing if the folder tree was never fully synced.
-                    var mediaParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
-                    if (mediaParentGuid != targetGuid && !await ExistsOnTargetAsync(mediaParentGuid, target, targetToken))
-                    {
-                        // Try to resolve the canonical path and recreate the folder hierarchy
-                        var canonicalUrl = await GetSourceContentUrlAsync(refGuid, sourceBaseUrl, sourceToken);
-                        if (!string.IsNullOrEmpty(canonicalUrl) && canonicalUrl.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase))
-                        {
-                            var lastSlash = canonicalUrl.LastIndexOf('/');
-                            var folderPath = lastSlash > 0 ? canonicalUrl[..(lastSlash + 1)] : "/globalassets/";
-                            mediaParentGuid = await EnsureGlobalAssetFolderPathAsync(folderPath, sourceBaseUrl, sourceToken, target, targetToken) ?? targetGuid;
-                        }
-                        else
-                        {
-                            await EnsureContentParentAsync(mediaParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
-                        }
-                    }
-                    var mediaStub = BuildMinimalAssetJson(refJson, mediaParentGuid);
-                    try
-                    {
-                        idMap[refGuid] = (await WriteAssetToTargetAsync(refGuid, refJson, mediaStub, sourceToken, target, targetToken)).id;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Could not upload global media {Guid}: {Error}", refGuid, ex.Message);
-                        failedDependencyGuids?.Add(refGuid.ToString("D"));
-                        if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-                            idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                    }
-                    onItemComplete?.Invoke();
-                }
-                continue;
-            }
-
-            // Block — depth-first; if it already exists on target, just wire the reference
-            var isLocalBlock = IsLocalContent(refJson);
-            Guid blockParentGuid;
-            if (isLocalBlock)
-            {
-                blockParentGuid = targetGuid;
-            }
-            else
-            {
-                blockParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
-                if (blockParentGuid != targetGuid)
-                    await EnsureContentParentAsync(blockParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
-            }
-
-            // Always re-transfer block content (even if the block already exists on target).
-            // Skipping existing blocks means stale data — links, URLs, and property changes
-            // made on source would never propagate. PUT is idempotent in the CMA.
-            try
-            {
-                idMap[refGuid] = await TransferItemCoreAsync(
-                    refGuid, refJson, sourceBaseUrl, sourceToken,
-                    target, targetToken,
-                    refGuid, blockParentGuid,
-                    effectiveStatus, visited, onItemComplete, sortIndex: null, deferredPatches, failedDependencyGuids);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("Could not transfer block {Guid}: {Error}", refGuid, ex.Message);
-                failedDependencyGuids?.Add(refGuid.ToString("D"));
-                if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-                    idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                onItemComplete?.Invoke();
-            }
-        }
-
-        // ── Step 2: Full PUT ──────────────────────────────────────────────────
-        // Full content (not a stub) ensures all required properties are present.
-        // Also causes Optimizely to auto-create the "For This Page/Block" asset bucket.
-        // Local media IDs are not yet known — corrected in step 4 if any were deferred.
-        var baseJson = StripReadOnlyProperties(sourceJson, preserveParentLink: false);
-        baseJson = InjectParentLink(baseJson, targetParentGuid);
-        if (idMap.Count > 0) baseJson = InjectTargetContentIds(baseJson, idMap);
-        baseJson = InjectStatus(baseJson, effectiveStatus);
-        // Resolve link-property hrefs to their correct target URLs before the generic domain swap,
-        // because path prefixes (e.g. /mattpage/) can differ between environments.
-        baseJson = await RelinkContentLinksAsync(baseJson, sourceBaseUrl, target, targetToken);
-        baseJson = ReplaceSourceDomain(baseJson, sourceBaseUrl, target.BaseUrl);
-
-        await WriteToTargetAsync(targetGuid, baseJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
-
-        // ── Step 3: Local media + XHTML inline images ─────────────────────────
-        // Asset bucket now exists. Upload deferred local media, then XHTML inline images.
-        var postIdMap = new Dictionary<Guid, int?>();
-        var xhtmlUrlMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var deferredMediaUrls = new Dictionary<Guid, string>();
-
-        foreach (var (refGuid, refJson) in deferredLocalMedia)
-        {
-            var mediaStub = BuildMinimalAssetJson(refJson, targetGuid);
-            try
-            {
-                var (mediaId, mediaRelUrl) = await WriteAssetToTargetAsync(refGuid, refJson, mediaStub, sourceToken, target, targetToken);
-                postIdMap[refGuid] = mediaId;
-                if (mediaRelUrl != null)
-                    deferredMediaUrls[refGuid] = mediaRelUrl;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("Could not upload local media {Guid}: {Error}", refGuid, ex.Message);
-                failedDependencyGuids?.Add(refGuid.ToString("D"));
-                if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-                    postIdMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
-            }
+            // No versions at all — a non-versionable container/folder. Just ensure it (and its
+            // container chain) exists on target under the same key; nothing to write.
+            await EnsureContainerExistsAsync(targetGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid>());
             onItemComplete?.Invoke();
+            return;
         }
 
-        var seenImagePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var srcUrl in ExtractXhtmlImageUrls(sourceJson))
+        var locales = ExtractStringArrayField(nodeResp.Body, "locales");
+        var defaultLocale = locales.Count > 0 ? locales[0] : versions[0].Locale;
+        // BUG FIX: a genuinely invariant/non-localized item (confirmed live: a shared image and a
+        // shared block referenced from a ContentArea) can come back with an empty `locales` array
+        // AND a null `locale` on its own version — there's simply no locale concept for it. Forwarding
+        // that null straight through to the target 400s ("The 'locale' field does not allow 'null'
+        // values.") and the whole item silently fails to transfer, which is why a ContentArea item
+        // (and anything it in turn referenced, like an inline image) never showed up on target even
+        // though nothing about ITS OWN properties was wrong. Falling back to the locale of whatever
+        // is transferring THIS item (ultimately the top-level page/item's own locale) gives the
+        // target write a value it will accept, and is the least-surprising choice — an invariant
+        // block ends up written under the same locale as the content that references it.
+        if (string.IsNullOrEmpty(defaultLocale)) defaultLocale = fallbackLocale;
+        foreach (var v in versions)
+            if (string.IsNullOrEmpty(v.Locale)) v.Locale = defaultLocale;
+        var masterVersion = versions.FirstOrDefault(v => string.Equals(v.Locale, defaultLocale, StringComparison.OrdinalIgnoreCase)) ?? versions[0];
+
+        // ── Step 1: transfer referenced dependencies depth-first ──────────────
+        var isMedia = IsMediaContentType(contentType);
+        if (!isMedia)
+            await ProcessReferencedDependenciesAsync(masterVersion.PropertiesJson, sourceBaseUrl, sourceToken, target, targetToken, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
+
+        // BUG FIX: an existing media item has nothing meaningful left to do — key preservation
+        // already guarantees its binary is correct (it was uploaded once, under this same key, the
+        // first time it was transferred), and CmsApiClient has no "add a version WITH new binary"
+        // call (CreateVersionAsync is JSON-only, for non-media property updates). Falling through to
+        // the normal write path for an existing media item means attempting a binary-less version
+        // add, which the target rejects outright — confirmed live: a page's image that had already
+        // been transferred in an earlier run threw a genuine HTTP 400 on every subsequent transfer
+        // of the page that referenced it, even though the asset was already present and fine on
+        // target, and got reported to the editor as a hard failure for something that wasn't broken.
+        if (isMedia && await ExistsOnTargetAsync(targetGuid, target, targetToken))
         {
-            var relPath = ToRelativePath(srcUrl);
-            if (string.IsNullOrEmpty(relPath)) continue;
-            var pathForLookup = relPath.Split('?')[0];
-            if (!seenImagePaths.Add(pathForLookup)) continue;
+            onItemComplete?.Invoke();
+            return;
+        }
 
-            var isContentAsset  = pathForLookup.StartsWith("/contentassets/", StringComparison.OrdinalIgnoreCase);
-            var isGlobalAsset   = pathForLookup.StartsWith("/globalassets/",  StringComparison.OrdinalIgnoreCase);
-            var isEpiServer     = pathForLookup.StartsWith("/EPiServer/",      StringComparison.OrdinalIgnoreCase)
-                               || pathForLookup.StartsWith("/episerver/",      StringComparison.OrdinalIgnoreCase);
-            var isPermanentLink = pathForLookup.StartsWith("/link/",           StringComparison.OrdinalIgnoreCase)
-                               && pathForLookup.EndsWith(".aspx",              StringComparison.OrdinalIgnoreCase);
-            if (!isContentAsset && !isGlobalAsset && !isEpiServer && !isPermanentLink) continue;
+        // ── Step 2: ensure the target owner/container chain exists ────────────
+        Guid effectiveParent;
+        bool useOwner;
+        if (isOwned && Guid.TryParseExact(sourceOwnerKey, "N", out var ownerGuid))
+        {
+            // Page-local content: owner is always something already in this transfer's ancestry
+            // (the page itself), so it will already exist by the time we get here.
+            effectiveParent = ownerGuid;
+            useOwner = true;
+        }
+        else if (targetParentGuid != Guid.Empty)
+        {
+            // BUG FIX: this used to be the LAST branch (source-container-mirroring took priority
+            // whenever isContained was true, which is true for nearly every normal page). That
+            // silently discarded whatever parent TransferSingleItemAsync actually resolved — the
+            // batch/plan's TargetParentGuid, which is where an editor's manual "Place Under" override
+            // (or even automatic ancestor-matching, whenever it differs from the source's literal
+            // parent) lives. Confirmed live: picking "About us" in the destination-tree picker still
+            // put the page under Start, because the source's own `container` field (Start) won every
+            // time. A non-empty targetParentGuid ONLY ever reaches here from TransferSingleItemAsync
+            // (top-level items in the transfer batch, each with an explicitly resolved parent) —
+            // ProcessReferencedDependenciesAsync always passes Guid.Empty for its recursive
+            // block/media calls specifically so THEY keep mirroring the source structure below. So
+            // this branch can never wrongly fire for a dependency; only for the item(s) the editor
+            // actually picked a destination for.
+            effectiveParent = targetParentGuid;
+            useOwner = false;
+        }
+        else if (isContained && Guid.TryParseExact(sourceContainerKey, "N", out var containerGuid) && containerGuid != Guid.Empty)
+        {
+            // A dependency (block/media, or a top-level item with no resolvable parent at all) —
+            // mirror its source container/folder chain, creating any missing link under the same key.
+            await EnsureContainerExistsAsync(containerGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { sourceGuid });
+            effectiveParent = containerGuid;
+            useOwner = false;
+        }
+        else
+        {
+            effectiveParent = targetParentGuid;
+            useOwner = false;
+        }
 
-            Guid? imageGuid = null;
-            try
-            {
-                imageGuid = await FindByUrlOnSourceAsync(pathForLookup, sourceBaseUrl, sourceToken);
-                if (!imageGuid.HasValue && (isEpiServer || isPermanentLink))
-                    imageGuid = TryResolveLocalContentGuid(pathForLookup);
-            }
-            catch { continue; }
+        // ── Step 3: create or add-version on target for the default locale ────
+        var exists = await ExistsOnTargetAsync(targetGuid, target, targetToken);
+        await WriteContentVersionAsync(
+            targetGuid, exists, contentType, useOwner, effectiveParent, masterVersion,
+            sourceBaseUrl, sourceToken, target, targetToken, effectiveStatus, isMedia, failedDependencyGuids);
 
-            if (!imageGuid.HasValue)
-            {
-                _logger.LogWarning("Could not resolve XHTML image URL to a GUID: {Url}", relPath);
-                continue;
-            }
+        // ── Step 4: every other language ───────────────────────────────────────
+        foreach (var version in versions)
+        {
+            if (string.Equals(version.Locale, masterVersion.Locale, StringComparison.OrdinalIgnoreCase)) continue;
+            if (languageFilter != null && languageFilter.Count > 0 && !languageFilter.Contains(version.Locale)) continue;
 
-            if (!visited.Add(imageGuid.Value))
-            {
-                // Image was already uploaded (e.g. as deferred local media in step 3a).
-                // CMA GET returns "url": null for contentassets, so check our upload cache first,
-                // then fall back to CDV which returns the real canonical path.
-                string existingUrl = null;
-                if (deferredMediaUrls.TryGetValue(imageGuid.Value, out var cachedUrl))
-                    existingUrl = cachedUrl;
-                else
-                    existingUrl = await GetTargetContentUrlViaCdvAsync(imageGuid.Value, target, targetToken);
-                if (existingUrl != null) xhtmlUrlMap[relPath] = existingUrl;
-                continue;
-            }
-
-            string imgJson;
-            try { imgJson = await ReadFromSourceAsync(imageGuid.Value, sourceBaseUrl, sourceToken); }
-            catch { continue; }
-
-            // Use the CDV canonical URL to determine where the image actually lives.
-            // The XHTML src may be an EPiServer internal URL (/EPiServer/CMS/Content/globalassets/...)
-            // which doesn't start with /globalassets/ — so we can't rely on the raw src path.
-            // The CDV by-GUID response always returns the clean canonical path.
-            var canonicalPath = await GetSourceContentUrlAsync(imageGuid.Value, sourceBaseUrl, sourceToken);
-            var isActuallyGlobal = !string.IsNullOrEmpty(canonicalPath)
-                && canonicalPath.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase);
-
-            Guid imgParentGuid;
-            if (isActuallyGlobal)
-            {
-                var lastSlash = canonicalPath.LastIndexOf('/');
-                var folderPath = lastSlash > 0 ? canonicalPath[..(lastSlash + 1)] : "/globalassets/";
-                imgParentGuid = await EnsureGlobalAssetFolderPathAsync(folderPath, sourceBaseUrl, sourceToken, target, targetToken) ?? targetGuid;
-            }
-            else
-            {
-                imgParentGuid = targetGuid;
-            }
+            // A branch can reference dependencies the master pass never saw (e.g. a block only
+            // used in a culture-specific ContentArea) — walk it too.
+            if (!isMedia)
+                await ProcessReferencedDependenciesAsync(version.PropertiesJson, sourceBaseUrl, sourceToken, target, targetToken, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
 
             try
             {
-                var imgStub = BuildMinimalAssetJson(imgJson, imgParentGuid);
-                var (_, targetRelUrl) = await WriteAssetToTargetAsync(imageGuid.Value, imgJson, imgStub, sourceToken, target, targetToken);
-                if (targetRelUrl == null)
-                    targetRelUrl = await GetTargetContentUrlViaCdvAsync(imageGuid.Value, target, targetToken);
-                if (targetRelUrl != null)
-                {
-                    xhtmlUrlMap[relPath] = targetRelUrl;
-                    _logger.LogDebug("XHTML image {Guid}: {Src} → {Tgt}", imageGuid.Value, relPath, targetRelUrl);
-                }
-                onItemComplete?.Invoke();
+                await WriteContentVersionAsync(
+                    targetGuid, true, contentType, useOwner, effectiveParent, version,
+                    sourceBaseUrl, sourceToken, target, targetToken, effectiveStatus, isMedia, failedDependencyGuids);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("Could not upload XHTML image {Guid}: {Error}", imageGuid.Value, ex.Message);
-                failedDependencyGuids?.Add(imageGuid.Value.ToString("D"));
-                onItemComplete?.Invoke();
+                _logger.LogWarning("Could not write language branch '{Locale}' for {Guid}: {Error}", version.Locale, targetGuid, ex.Message);
             }
-        }
-
-        // ── Step 4: Second PUT if anything was uploaded post-step-2 ──────────
-        // onItemComplete fires here (after all work for this item is truly done).
-        if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0)
-        {
-            var patchedJson = baseJson;
-            if (postIdMap.Count > 0) patchedJson = InjectTargetContentIds(patchedJson, postIdMap);
-            if (xhtmlUrlMap.Count > 0) patchedJson = RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap);
-            var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
-            onItemComplete?.Invoke();
-            return result;
         }
 
         onItemComplete?.Invoke();
-        return await GetTargetContentIdAsync(targetGuid, target, targetToken);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private List<ContentReference> CollectItems(ContentReference root, bool includeChildren)
+    // Walks a version's properties for content references (ContentArea items + single references
+    // + inline epi-contentfragment blocks) and transfers each one depth-first, skipping anything
+    // that isn't a block or media (page references are tracked, not auto-transferred — matches
+    // the CMA-era engine's behaviour). `visited` dedups across the whole item transfer, including
+    // branches, so a dependency shared by several languages is only actually written once.
+    private async Task ProcessReferencedDependenciesAsync(
+        string propertiesJson, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        HashSet<Guid> visited, Action onItemComplete, List<string> failedDependencyGuids, HashSet<string> languageFilter,
+        string fallbackLocale)
     {
-        var queue = new Queue<ContentReference>();
-        var ordered = new List<ContentReference>();
-        queue.Enqueue(root);
+        var refGuids = ExtractPropertyReferenceGuids(propertiesJson);
+        foreach (var frag in XhtmlProcessor.ExtractXhtmlContentFragments(propertiesJson))
+            if (frag.Guid != Guid.Empty && !refGuids.Contains(frag.Guid))
+                refGuids.Add(frag.Guid);
 
-        while (queue.Count > 0)
+        // BUG FIX: inline <img>/<a href> assets embedded in rich text (permalinks, e.g.
+        // /link/{guid}.aspx) were never scanned at all — ExtractXhtmlImageUrls exists (carried
+        // over unchanged from the CMA-era XhtmlProcessor) but nothing called it, so every inline
+        // image/linked asset in rich text silently failed to transfer: RewriteInlineImages still
+        // ran and wrote out a permalink pointing at the SOURCE guid, but that guid was never
+        // created on the target, leaving a broken image. Confirmed live via an actual gadget
+        // transfer before this fix.
+        foreach (var url in XhtmlProcessor.ExtractXhtmlImageUrls(propertiesJson))
         {
-            var current = queue.Dequeue();
-            ordered.Add(current);
-
-            if (includeChildren)
-            {
-                // Custom page types from external assemblies may not be registered in this project.
-                // Optimizely falls back to loading them as ContentData rather than PageData, so
-                // .OfType<PageData>() silently discards them. Exclude known non-page types instead.
-                using var e = _contentLoader.GetChildren<IContent>(current, LanguageSelector.AutoDetect(true)).GetEnumerator();
-                var pageChildren = new List<(ContentReference contentRef, int sortIndex)>();
-                while (true)
-                {
-                    bool moved;
-                    IContent child = null;
-                    try { moved = e.MoveNext(); if (moved) child = e.Current; }
-                    catch { break; }
-                    if (!moved) break;
-                    if (child is BlockData || child is IContentMedia || child is ContentFolder) continue;
-                    if (child is IVersionable versionable && versionable.Status != VersionStatus.Published) continue;
-                    var sortIdx = 0;
-                    try { var psi = child.Property["PageSortIndex"]?.Value; if (psi != null) sortIdx = Convert.ToInt32(psi); } catch { }
-                    pageChildren.Add((child.ContentLink, sortIdx));
-                }
-                foreach (var (childRef, _) in pageChildren.OrderBy(t => t.sortIndex))
-                    queue.Enqueue(childRef);
-            }
+            if (!TryParsePermalinkGuid(url, out var inlineGuid)) continue;
+            if (!refGuids.Contains(inlineGuid)) refGuids.Add(inlineGuid);
         }
 
-        return ordered;
-    }
-
-    private void LogRequest(string description, string url, string token, string requestBody = null)
-    {
-        var method = description.Split(' ')[0]; // e.g. "GET" or "PUT"
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine($">>> {method} {url}");
-        sb.AppendLine($"    Purpose: {description}");
-        if (!string.IsNullOrEmpty(requestBody))
+        foreach (var refGuid in refGuids)
         {
-            sb.AppendLine("    Content-Type: application/json");
-            sb.AppendLine(requestBody);
-        }
-        _logger.LogDebug("{HttpRequest}", sb.ToString().TrimEnd());
-    }
+            if (!visited.Add(refGuid)) continue;
 
-    private void LogResponse(string description, string url, int statusCode, string responseBody)
-    {
-        _logger.LogDebug("<<< {Status} {Description} {Url}\n{ResponseBody}", statusCode, description, url, responseBody);
-    }
+            var refKey = ToKey(refGuid);
+            var refNodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, refKey, "read referenced source node");
+            if (!refNodeResp.IsSuccess) { visited.Remove(refGuid); continue; }
 
-    private async Task<string> ReadFromSourceAsync(Guid guid, string sourceBaseUrl, string sourceToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET", url, sourceToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode)
-            throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-        return body;
-    }
+            var refContentType = ExtractStringField(refNodeResp.Body, "contentType");
+            if (IsPageContentType(refContentType)) continue; // tracked, not transferred
 
-    private static readonly string[] ReadOnlyProperties =
-    [
-        "existingLanguages", "masterLanguage", "saved", "created", "changed",
-        "contentLink", "parentLink", "url", "routeSegment", "previewUrl",
-        "publishedVersion", "statusReasons", "editUrl"
-    ];
+            if (!IsMediaContentType(refContentType) && !IsBlockContentType(refContentType)) continue;
 
-    private static string StripReadOnlyProperties(string json, bool preserveParentLink = false)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        foreach (var key in ReadOnlyProperties)
-        {
-            if (preserveParentLink && key == "parentLink") continue;
-            node.Remove(key);
-        }
-        // Strip environment-specific integer ids from every content reference throughout
-        // the document. Integer ids differ per environment; the target resolves by guidValue.
-        StripContentReferenceIds(node);
-        return node.ToJsonString();
-    }
-
-    private static readonly string[] ContentRefEnvFields = ["id", "workId", "url", "providerName", "expanded"];
-
-    private static void StripContentReferenceIds(JsonNode node)
-    {
-        if (node is JsonObject obj)
-        {
-            if (obj.ContainsKey("guidValue"))
-            {
-                // Keep only guidValue. id/workId are environment-specific integers;
-                // url/providerName/expanded are source-server values that confuse the target.
-                foreach (var field in ContentRefEnvFields)
-                    obj.Remove(field);
-            }
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) StripContentReferenceIds(child);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) StripContentReferenceIds(item);
-        }
-    }
-
-    // Strips properties of type PropertyBlob — server-managed blobs (thumbnail, etc.)
-    // that are auto-generated on upload and cannot be written via the API.
-    private static string StripBlobProperties(string json)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        var toRemove = node
-            .Where(kvp =>
-                kvp.Value is JsonObject obj &&
-                obj["propertyDataType"]?.GetValue<string>() == "PropertyBlob")
-            .Select(kvp => kvp.Key)
-            .ToList();
-        foreach (var key in toRemove)
-            node.Remove(key);
-        return node.ToJsonString();
-    }
-
-    private static string InjectStatus(string json, string status)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        node["status"] = status;
-        return node.ToJsonString();
-    }
-
-    // Injects a pre-extracted sort index into the PUT body.
-    // Sort index is read synchronously from IContentLoader before any awaits in the caller.
-    private static string InjectSortIndex(string json, int? sortIndex)
-    {
-        if (!sortIndex.HasValue) return json;
-        try
-        {
-            var node = JsonNode.Parse(json)?.AsObject();
-            if (node == null) return json;
-            node["sortIndex"] = sortIndex.Value;
-            return node.ToJsonString();
-        }
-        catch { }
-        return json;
-    }
-
-    private static string InjectParentLink(string json, Guid parentGuid)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        node["parentLink"] = new JsonObject { ["guidValue"] = parentGuid.ToString() };
-        return node.ToJsonString();
-    }
-
-    // Walks the JSON tree and, for every content-reference object whose guidValue is in
-    // targetIdMap, injects the corresponding target integer id + workId so the Content
-    // Management API can bind the property (guidValue alone is not enough for media refs).
-    private static string InjectTargetContentIds(string json, Dictionary<Guid, int?> targetIdMap)
-    {
-        var node = JsonNode.Parse(json);
-        if (node == null) return json;
-        InjectContentIds(node, targetIdMap);
-        return node.ToJsonString();
-    }
-
-    private static void InjectContentIds(JsonNode node, Dictionary<Guid, int?> targetIdMap)
-    {
-        if (node is JsonObject obj)
-        {
-            if (obj["guidValue"] is JsonValue guidVal)
-            {
-                try
-                {
-                    if (Guid.TryParse(guidVal.GetValue<string>(), out var guid) &&
-                        targetIdMap.TryGetValue(guid, out var targetId) &&
-                        targetId.HasValue)
-                    {
-                        obj["id"] = targetId.Value;
-                        obj["workId"] = 0;
-                    }
-                }
-                catch { }
-            }
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) InjectContentIds(child, targetIdMap);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) InjectContentIds(item, targetIdMap);
-        }
-    }
-
-    private async Task<int?> GetTargetContentIdAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (get target ID)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (get target ID)", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                cl.TryGetProperty("id", out var idProp) &&
-                idProp.ValueKind == JsonValueKind.Number)
-                return idProp.GetInt32();
-        }
-        catch { }
-        return null;
-    }
-
-    // Resolves an EPiServer-internal or routed URL to a content GUID using the local CMS router.
-    // Used for /EPiServer/CMS/Content/... paths that the CMS editor stores as permanent links.
-    private Guid? TryResolveLocalContentGuid(string relPath)
-    {
-        try
-        {
-            var content = _urlResolver.Route(new UrlBuilder(relPath));
-            if (content != null) return content.ContentGuid;
-        }
-        catch (Exception ex) { _logger.LogDebug("Local URL resolve failed for {Path}: {Error}", relPath, ex.Message); }
-        return null;
-    }
-
-    // Fetches the content URL from the target environment after an asset has been written.
-    // Used when the PUT response doesn't include a url field (so xhtmlUrlMap can still be populated).
-    private async Task<string> GetTargetContentUrlAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (fetch target URL after upload)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (fetch target URL after upload)", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-            {
-                var fullUrl = urlProp.GetString() ?? "";
-                if (Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri))
-                    return uri.PathAndQuery;
-                if (fullUrl.StartsWith('/')) return fullUrl;
-            }
-        }
-        catch { }
-        return null;
-    }
-
-    // Uses the Content Delivery API (not CMA) to resolve a canonical relative URL for content on the target.
-    // CMA GET returns "url": null for contentassets images; CDV returns the real path via contentLink.url.
-    private async Task<string> GetTargetContentUrlViaCdvAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/{guid}";
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        request.Headers.Add("Accept", "application/json");
-        LogRequest("GET (CDV — resolve target asset URL)", apiUrl, targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (CDV — resolve target asset URL)", apiUrl, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                cl.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-            {
-                var fullUrl = urlProp.GetString();
-                if (string.IsNullOrEmpty(fullUrl)) return null;
-                return Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : fullUrl;
-            }
-        }
-        catch { }
-        return null;
-    }
-
-    // Resolves the correct parent folder GUID on the TARGET for a globalassets image.
-    // Reads parentLink.url from the source image JSON, extracts the relative path, looks it up
-    // on the target, and creates any missing intermediate folders if needed.
-    private async Task<Guid?> ResolveGlobalAssetFolderOnTargetAsync(
-        string imgJson,
-        DxpEnvironmentConfig target, string targetToken,
-        string sourceBaseUrl, string sourceToken)
-    {
-        try
-        {
-            string parentUrl;
-            using (var doc = JsonDocument.Parse(imgJson))
-            {
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("parentLink", out var pl) || pl.ValueKind != JsonValueKind.Object) return null;
-                if (!pl.TryGetProperty("url", out var urlProp) || urlProp.ValueKind != JsonValueKind.String) return null;
-                parentUrl = urlProp.GetString();
-            }
-            if (string.IsNullOrEmpty(parentUrl)) return null;
-
-            var relPath = Uri.TryCreate(parentUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : parentUrl;
-            if (!relPath.EndsWith('/')) relPath += '/';
-            if (!relPath.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase)) return null;
-
-            // Try direct lookup first; if not found, create the full folder path
-            return await FindByUrlOnTargetAsync(relPath, target, targetToken)
-                ?? await EnsureGlobalAssetFolderPathAsync(relPath, sourceBaseUrl, sourceToken, target, targetToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("ResolveGlobalAssetFolderOnTargetAsync failed: {Error}", ex.Message);
-        }
-        return null;
-    }
-
-    // Walks the globalassets path segment-by-segment on the target, creating any folder that
-    // doesn't exist yet. Returns the GUID of the deepest (innermost) folder.
-    private async Task<Guid?> EnsureGlobalAssetFolderPathAsync(
-        string relFolderPath,
-        string sourceBaseUrl, string sourceToken,
-        DxpEnvironmentConfig target, string targetToken)
-    {
-        // "/globalassets/events/conference/" → ["globalassets", "events", "conference"]
-        var parts = relFolderPath.Trim('/').Split('/');
-
-        // Resolve the globalassets root folder on the target (must already exist)
-        var currentPath = "/globalassets/";
-        var currentGuid = await FindByUrlOnTargetAsync(currentPath, target, targetToken);
-        if (!currentGuid.HasValue)
-        {
-            _logger.LogWarning("Could not find /globalassets/ root on target — cannot create folder path {Path}", relFolderPath);
-            return null;
-        }
-
-        // Walk each segment after "globalassets"
-        for (int i = 1; i < parts.Length; i++)
-        {
-            var segment = parts[i];
-            if (string.IsNullOrEmpty(segment)) continue;
-            var nextPath = currentPath + segment + "/";
-
-            var nextGuid = await FindByUrlOnTargetAsync(nextPath, target, targetToken);
-            if (nextGuid.HasValue)
-            {
-                currentGuid = nextGuid;
-                currentPath = nextPath;
-                continue;
-            }
-
-            // Folder missing on target — look up its content type from source, then create it
-            string leafContentType = "ContentFolder";
-            var sourceFolderGuid = await FindByUrlOnSourceAsync(nextPath, sourceBaseUrl, sourceToken);
-            if (sourceFolderGuid.HasValue)
-            {
-                try
-                {
-                    var folderJson = await ReadFromSourceAsync(sourceFolderGuid.Value, sourceBaseUrl, sourceToken);
-                    using var doc = JsonDocument.Parse(folderJson);
-                    if (doc.RootElement.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
-                    {
-                        var last = ct.EnumerateArray().LastOrDefault();
-                        if (last.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(last.GetString()))
-                            leafContentType = last.GetString();
-                    }
-                }
-                catch { /* use default */ }
-            }
-
-            var newFolderGuid = Guid.NewGuid();
-            var folderCreateJson = new JsonObject
-            {
-                ["parentLink"] = new JsonObject { ["guidValue"] = currentGuid.Value.ToString("D") },
-                ["name"] = segment,
-                ["status"] = "Published",
-                ["contentType"] = new JsonArray(leafContentType)
-            }.ToJsonString();
-
-            _logger.LogDebug("Creating missing globalassets folder '{Segment}' at {Path} (parent={Parent})", segment, nextPath, currentGuid.Value);
             try
             {
-                await WriteToTargetAsync(newFolderGuid, folderCreateJson, target, targetToken);
-                currentGuid = newFolderGuid;
-                currentPath = nextPath;
+                await TransferItemCoreAsync(refGuid, sourceBaseUrl, sourceToken, target, targetToken,
+                    refGuid, Guid.Empty, "Published", visited, onItemComplete, failedDependencyGuids, languageFilter, fallbackLocale);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("Failed to create globalassets folder '{Segment}': {Error} — uploading to parent instead", segment, ex.Message);
-                // currentGuid stays as the parent — best effort
+                _logger.LogWarning("Could not transfer dependency {Guid}: {Error}", refGuid, ex.Message);
+                failedDependencyGuids?.Add(refGuid.ToString("D"));
+                onItemComplete?.Invoke();
             }
         }
-
-        return currentGuid;
     }
 
-
-    // Returns the canonical relative URL of a content item on the source, using the CDV by-GUID endpoint.
-    // e.g. for an EPiServer internal image URL the CDV returns "/globalassets/events/image.jpg".
-    private async Task<string> GetSourceContentUrlAsync(Guid guid, string sourceBaseUrl, string sourceToken)
+    // Ensures a container chain exists on the target, creating any missing link (and its own
+    // container first, recursively) using the SAME key as the source. Replaces the CMA-era
+    // engine's URL-based EnsureGlobalAssetFolderPathAsync/EnsureContentParentAsync entirely — no
+    // URL resolution needed at all when the target key is always known in advance.
+    private async Task EnsureContainerExistsAsync(
+        Guid containerGuid, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken, HashSet<Guid> seen)
     {
+        if (!seen.Add(containerGuid)) return;
+        if (await ExistsOnTargetAsync(containerGuid, target, targetToken)) return;
+
+        var key = ToKey(containerGuid);
+        var nodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, key, "read missing container");
+        if (!nodeResp.IsSuccess)
+        {
+            _logger.LogWarning("Could not read missing container {Guid} from source: HTTP {Status}", containerGuid, (int)nodeResp.Status);
+            return;
+        }
+
+        var contentType = ExtractStringField(nodeResp.Body, "contentType");
+        Guid? grandparentGuid = TryExtractStringField(nodeResp.Body, "container", out var gp) && Guid.TryParseExact(gp, "N", out var gpg) ? gpg : null;
+        if (grandparentGuid.HasValue && grandparentGuid.Value != Guid.Empty)
+            await EnsureContainerExistsAsync(grandparentGuid.Value, sourceBaseUrl, sourceToken, target, targetToken, seen);
+
+        // KNOWN GAP: if this container has no container/owner of its own (a true root-level
+        // container, e.g. the site root itself), it can't be created via this path at all —
+        // content_create requires exactly one of container/owner, and any CMS installation
+        // capable of running this transfer already has its own root containers, so this should
+        // never actually fire in practice. Skip rather than send an invalid request.
+        if (!grandparentGuid.HasValue || grandparentGuid.Value == Guid.Empty)
+        {
+            _logger.LogWarning("Missing container {Guid} has no container/owner of its own on source — cannot create it on target (likely a root-level container that should already exist)", containerGuid);
+            return;
+        }
+
+        var versionsResp = await _api.ListVersionsAsync(sourceBaseUrl, sourceToken, key, "read missing container versions");
+        var versions = versionsResp.IsSuccess ? ParseVersionList(versionsResp.Body) : new List<SourceVersion>();
+
+        var createJson = new JsonObject
+        {
+            ["contentType"] = contentType,
+            ["key"] = key,
+            ["container"] = ToKey(grandparentGuid.Value)
+        };
+        if (versions.Count > 0)
+        {
+            var v = versions[0];
+            createJson["initialVersion"] = new JsonObject
+            {
+                ["displayName"] = v.DisplayName,
+                ["locale"] = v.Locale,
+                ["properties"] = JsonNode.Parse(v.PropertiesJson)
+            };
+        }
+
         try
         {
-            var client = _httpClientFactory.CreateClient();
-            var apiUrl = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/{guid}";
-            var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-            request.Headers.Add("Accept", "application/json");
-            var response = await client.SendAsync(request);
-            if (!response.IsSuccessStatusCode) return null;
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                cl.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
+            var resp = await _api.CreateContentAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), "create missing container");
+            if (!resp.IsSuccess && resp.Status != HttpStatusCode.Conflict)
+                _logger.LogWarning("Could not create missing container {Guid} on target: HTTP {Status}: {Body}", containerGuid, (int)resp.Status, resp.Body);
+            else
+                _logger.LogDebug("Created missing container {Guid} on target", containerGuid);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not create missing container {Guid} on target: {Error}", containerGuid, ex.Message);
+        }
+    }
+
+    // Creates the item on target (if it doesn't exist yet) or adds a new version to it (if it
+    // does), for one locale. Handles media (binary upload) vs. regular content, inline-image
+    // rewriting, and the bounded strip-and-retry loop for properties the target rejects.
+    private async Task WriteContentVersionAsync(
+        Guid targetGuid, bool targetExists, string contentType, bool useOwner, Guid parentGuid, SourceVersion version,
+        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        string effectiveStatus, bool isMedia, List<string> failedDependencyGuids)
+    {
+        var key = ToKey(targetGuid);
+        var propertiesNode = (JsonNode.Parse(version.PropertiesJson) as JsonObject) ?? new JsonObject();
+        RewriteInlineImages(propertiesNode);
+
+        var published = effectiveStatus == "Published" ? DateTimeOffset.UtcNow : (DateTimeOffset?)null;
+
+        byte[] mediaBytes = null;
+        string mediaFileName = null, mediaMimeType = null;
+        if (isMedia && !targetExists)
+        {
+            (mediaBytes, mediaFileName, mediaMimeType) = await DownloadMediaAsync(sourceBaseUrl, sourceToken, ToKey(ToGuid(key)), version);
+        }
+
+        for (var attempt = 0; attempt < MaxWriteAttempts; attempt++)
+        {
+            CmsApiResponse resp;
+            if (!targetExists)
             {
-                var fullUrl = urlProp.GetString();
-                if (string.IsNullOrEmpty(fullUrl)) return null;
-                return Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : fullUrl;
-            }
-        }
-        catch { /* best-effort */ }
-        return null;
-    }
+                // KNOWN GOTCHA (confirmed live): optional fields like routeSegment/published must
+                // be OMITTED, not sent as explicit JSON null — "The 'routeSegment' field does not
+                // allow 'null' values." SetIfNotNull below handles this consistently.
+                var initialVersion = new JsonObject { ["displayName"] = version.DisplayName, ["locale"] = version.Locale };
+                SetIfNotNull(initialVersion, "routeSegment", version.RouteSegment);
+                SetIfNotNull(initialVersion, "published", published?.ToString("O"));
+                initialVersion["properties"] = propertiesNode.DeepClone();
 
-    // Looks up a content item GUID on the SOURCE environment by its relative URL.
-    // Used for /globalassets/ paths where the GUID cannot be extracted directly.
-    private async Task<Guid?> FindByUrlOnSourceAsync(string relativeUrl, string sourceBaseUrl, string sourceToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/?contentURL={Uri.EscapeDataString(relativeUrl)}";
-        LogRequest("GET (URL lookup on source)", apiUrl, sourceToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-        request.Headers.Add("Accept", "application/json");
-        var response = await client.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (URL lookup on source)", apiUrl, (int)response.StatusCode, json);
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.LogWarning("XHTML URL lookup returned {Status} for {Url}", (int)response.StatusCode, relativeUrl);
-            return null;
-        }
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        var element = root.ValueKind == JsonValueKind.Array
-            ? (root.GetArrayLength() > 0 ? root[0] : (JsonElement?)null)
-            : root;
-        if (element is null) return null;
-        if (element.Value.TryGetProperty("contentLink", out var cl) &&
-            cl.TryGetProperty("guidValue", out var gp) &&
-            Guid.TryParse(gp.GetString(), out var guid))
-            return guid;
-        _logger.LogWarning("XHTML URL lookup response had no guidValue for {Url}", relativeUrl);
-        return null;
-    }
+                var createJson = new JsonObject { ["contentType"] = contentType, ["key"] = key, ["initialVersion"] = initialVersion };
+                if (useOwner) createJson["owner"] = ToKey(parentGuid);
+                else createJson["container"] = ToKey(parentGuid);
 
-    // Extracts all image src attribute values from PropertyXhtmlString fields in a JSON document.
-    private static List<string> ExtractXhtmlImageUrls(string json)
-    {
-        var urls = new List<string>();
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            CollectXhtmlUrls(doc.RootElement, urls);
-        }
-        catch { }
-        return urls;
-    }
+                resp = mediaBytes != null
+                    ? await _api.CreateContentWithBinaryAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), mediaBytes, mediaFileName, mediaMimeType, "create content (media)")
+                    : await _api.CreateContentAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), "create content");
 
-    private static void CollectXhtmlUrls(JsonElement element, List<string> urls)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            if (element.TryGetProperty("propertyDataType", out var pdt) &&
-                pdt.GetString() == "PropertyXhtmlString" &&
-                element.TryGetProperty("value", out var val) &&
-                val.ValueKind == JsonValueKind.String)
-            {
-                var html = val.GetString() ?? "";
-                foreach (Match m in Regex.Matches(html, @"src=""([^""]+)"""))
-                    urls.Add(m.Groups[1].Value);
-            }
-            foreach (var prop in element.EnumerateObject())
-                CollectXhtmlUrls(prop.Value, urls);
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                CollectXhtmlUrls(item, urls);
-        }
-    }
-
-    // Replaces the source environment origin (scheme+host) with the target origin in every
-    // string value throughout the JSON document. Handles plain URL properties (PropertyUrl,
-    // PropertyLongString containing links) as well as any other field that may store an
-    // absolute URL pointing back at the source environment.
-    private static string ReplaceSourceDomain(string json, string sourceBaseUrl, string targetBaseUrl)
-    {
-        try
-        {
-            var sourceOrigin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
-            var targetOrigin = new Uri(targetBaseUrl).GetLeftPart(UriPartial.Authority);
-            if (string.IsNullOrEmpty(sourceOrigin) ||
-                string.Equals(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase))
-                return json;
-            var node = JsonNode.Parse(json)?.AsObject();
-            if (node == null) return json;
-            ReplaceOriginInNodes(node, sourceOrigin, targetOrigin);
-            return node.ToJsonString();
-        }
-        catch { return json; }
-    }
-
-    private static void ReplaceOriginInNodes(JsonNode node, string sourceOrigin, string targetOrigin)
-    {
-        if (node is JsonObject obj)
-        {
-            foreach (var key in obj.Select(kvp => kvp.Key).ToList())
-            {
-                var child = obj[key];
-                if (child is JsonValue val && val.TryGetValue(out string str) &&
-                    !string.IsNullOrEmpty(str) &&
-                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+                if (resp.Status == HttpStatusCode.Conflict)
                 {
-                    obj[key] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
-                }
-                else if (child is JsonObject || child is JsonArray)
-                {
-                    ReplaceOriginInNodes(child, sourceOrigin, targetOrigin);
+                    // Already exists (race, or a previous partial run) — fall through to a version write.
+                    targetExists = true;
+                    continue;
                 }
             }
-        }
-        else if (node is JsonArray arr)
-        {
-            for (int i = 0; i < arr.Count; i++)
+            else
             {
-                var item = arr[i];
-                if (item is JsonValue val && val.TryGetValue(out string str) &&
-                    !string.IsNullOrEmpty(str) &&
-                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+                var versionJson = new JsonObject { ["locale"] = version.Locale, ["displayName"] = version.DisplayName };
+                SetIfNotNull(versionJson, "routeSegment", version.RouteSegment);
+                SetIfNotNull(versionJson, "published", published?.ToString("O"));
+                versionJson["properties"] = propertiesNode.DeepClone();
+                resp = await _api.CreateVersionAsync(target.BaseUrl, targetToken, key, versionJson.ToJsonString(), "create version");
+            }
+
+            if (resp.IsSuccess)
+            {
+                if (effectiveStatus == "Published")
+                    await PublishLatestVersionAsync(target.BaseUrl, targetToken, key, version.Locale);
+                return;
+            }
+
+            if (resp.Status == HttpStatusCode.BadRequest)
+            {
+                // BUG FIX: routeSegment (the page's "Name in URL" slug) must be unique among its
+                // target siblings, but the source's slug can collide with something that already
+                // exists on the target under a COMPLETELY DIFFERENT key — e.g. a page created
+                // directly on target, or a same-named page transferred earlier under a different
+                // guid. Confirmed live: "\"Name in URL\" with value \"alloy-track\" is already in
+                // use by Alloy Track (8)." routeSegment is optional — SetIfNotNull already omits it
+                // when empty — so dropping it here and letting the target auto-generate a unique
+                // slug (exactly what the CMS UI does when you save a page with a colliding name) is
+                // the right recovery, rather than failing the whole item outright. This has to be
+                // checked before ExtractOffendingField below because "routeSegment" isn't a
+                // "properties.X" field at all, so that path never even looks at it.
+                if (HasRouteSegmentConflict(resp.Body) && !string.IsNullOrEmpty(version.RouteSegment))
                 {
-                    arr[i] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
+                    _logger.LogDebug("routeSegment '{Slug}' conflicts on target for {Key} — omitting it and retrying ({Attempt}/{Max})", version.RouteSegment, key, attempt + 1, MaxWriteAttempts);
+                    version.RouteSegment = null;
+                    failedDependencyGuids?.Add($"{key}:routeSegment (value omitted — conflicted with existing target content)");
+                    continue;
                 }
-                else if (item is JsonObject || item is JsonArray)
+
+                // The new API reports both "unknown property" (target's content type doesn't
+                // recognise it — a schema drift between environments, CMA's old PropertyNotFound
+                // case) and "required property is missing" (the SAME error shape). Stripping is
+                // the right fix for the first case. For the second, it is only a best-effort
+                // degradation, not a real fix — a required property should almost never actually
+                // be empty here, since propertiesNode is copied verbatim from a source version
+                // that already passed this same validation when it was saved; if this DOES fire in
+                // practice it is most likely a required reference whose target failed to transfer
+                // (e.g. a circular dependency). CMA's engine handled that case with fallback-value
+                // substitution and a deferred second-pass patch once the reference existed —
+                // deliberately NOT reimplemented here (see CLAUDE.md known gaps). Stripping still
+                // lets the rest of the item transfer rather than failing it outright; the omission
+                // is tracked in failedDependencyGuids so the UI surfaces it.
+                //
+                // BUG FIX: when the bad value is ONE item inside a ContentArea (e.g. a reference to
+                // a dependency that itself couldn't be resolved/transferred — confirmed live via a
+                // ContentArea item, "New Teaser", that was unresolvable on the source and silently
+                // dropped by the dependency walk, leaving a dangling reference in the parent's
+                // ContentArea array), stripping the WHOLE top-level property throws away every OTHER
+                // item in that array too — confirmed live: a 3-item ContentArea with only one bad
+                // item came through on target completely empty. ExtractOffendingField now also
+                // reports the array index when the field path is "Prop.value[N]..."; when present
+                // and that property is actually an array, remove just that one element instead of
+                // the whole property, preserving the good items.
+                var (badField, badIndex) = ExtractOffendingField(resp.Body);
+                if (badField != null && propertiesNode.TryGetPropertyValue(badField, out var badPropNode) && badPropNode is JsonObject badPropObj)
                 {
-                    ReplaceOriginInNodes(item, sourceOrigin, targetOrigin);
-                }
-            }
-        }
-    }
-
-    // Resolves internal link URLs in PropertyLinkCollection items and PropertyUrl properties
-    // to their correct target-environment URLs. Simple domain replacement is not sufficient
-    // because source environments can have path prefixes (e.g. /mattpage/) that don't exist
-    // on target. For each href/value containing the source origin we:
-    //   1. Look up the page by its contentLink.guidValue via the target CDV (most reliable).
-    //   2. Fall back to finding the page by its source URL path on target.
-    //   3. Last resort: plain domain swap.
-    // Must be called before ReplaceSourceDomain so the source origin is still detectable.
-    private async Task<string> RelinkContentLinksAsync(
-        string json,
-        string sourceBaseUrl,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        try
-        {
-            var sourceOrigin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
-            var targetOrigin = new Uri(target.BaseUrl).GetLeftPart(UriPartial.Authority);
-            if (string.IsNullOrEmpty(sourceOrigin) ||
-                string.Equals(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase))
-                return json;
-            var node = JsonNode.Parse(json)?.AsObject();
-            if (node == null) return json;
-            await RelinkUrlsInNodeAsync(node, sourceOrigin, targetOrigin, target, targetToken);
-            return node.ToJsonString();
-        }
-        catch { return json; }
-    }
-
-    private async Task RelinkUrlsInNodeAsync(
-        JsonNode node,
-        string sourceOrigin,
-        string targetOrigin,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        if (node is JsonObject obj)
-        {
-            // PropertyLinkCollection item: object with an "href" string containing the source origin
-            if (obj["href"] is JsonValue hrefVal && hrefVal.TryGetValue(out string href) &&
-                !string.IsNullOrEmpty(href) &&
-                href.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
-            {
-                obj["href"] = await ResolveToTargetUrlAsync(
-                    href, obj["contentLink"] as JsonObject, sourceOrigin, targetOrigin, target, targetToken);
-            }
-
-            // PropertyUrl: { "value": "https://source/...", "propertyDataType": "PropertyUrl" }
-            if (obj["propertyDataType"] is JsonValue pdtVal &&
-                string.Equals(pdtVal.GetValue<string>(), "PropertyUrl", StringComparison.OrdinalIgnoreCase) &&
-                obj["value"] is JsonValue urlVal && urlVal.TryGetValue(out string urlStr) &&
-                !string.IsNullOrEmpty(urlStr) &&
-                urlStr.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
-            {
-                obj["value"] = await ResolveToTargetUrlAsync(
-                    urlStr, null, sourceOrigin, targetOrigin, target, targetToken);
-            }
-
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) await RelinkUrlsInNodeAsync(child, sourceOrigin, targetOrigin, target, targetToken);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) await RelinkUrlsInNodeAsync(item, sourceOrigin, targetOrigin, target, targetToken);
-        }
-    }
-
-    // Resolves a single source URL to its correct target URL.
-    // Priority: GUID lookup → path lookup on target → domain swap.
-    private async Task<string> ResolveToTargetUrlAsync(
-        string sourceUrl,
-        JsonObject contentLinkNode,
-        string sourceOrigin,
-        string targetOrigin,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        // 1. GUID-based CDV lookup — survives URL-segment differences between environments
-        if (contentLinkNode != null &&
-            Guid.TryParse(contentLinkNode["guidValue"]?.GetValue<string>(), out var linkedGuid))
-        {
-            var targetUrl = await GetTargetContentUrlViaCdvAsync(linkedGuid, target, targetToken);
-            if (!string.IsNullOrEmpty(targetUrl))
-            {
-                var result = targetUrl.StartsWith('/') ? targetOrigin + targetUrl : targetUrl;
-                _logger.LogDebug("Relinked (GUID): {Src} → {Tgt}", sourceUrl, result);
-                return result;
-            }
-        }
-
-        // 2. URL-path lookup on target
-        var relPath = Uri.TryCreate(sourceUrl, UriKind.Absolute, out var srcUri)
-            ? srcUri.PathAndQuery : null;
-        if (!string.IsNullOrEmpty(relPath) && relPath != "/")
-        {
-            var foundGuid = await FindByUrlOnTargetAsync(relPath, target, targetToken);
-            if (foundGuid.HasValue)
-            {
-                var targetUrl = await GetTargetContentUrlViaCdvAsync(foundGuid.Value, target, targetToken);
-                if (!string.IsNullOrEmpty(targetUrl))
-                {
-                    var result = targetUrl.StartsWith('/') ? targetOrigin + targetUrl : targetUrl;
-                    _logger.LogDebug("Relinked (URL path): {Src} → {Tgt}", sourceUrl, result);
-                    return result;
-                }
-            }
-        }
-
-        // 3. Domain swap only — path may still be wrong but at least the origin is correct
-        return sourceUrl.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
-    }
-
-    // Strips the source environment origin (scheme+host) from all image src URLs inside
-    // PropertyXhtmlString values so that relative paths (/contentassets/... /globalassets/...)
-    // resolve correctly on any target environment.
-    // xhtmlUrlMap (optional): source relative path → target relative path. Applied after stripping
-    // the origin so that bucket-GUID mismatches between environments are fixed up.
-    private static string RewriteXhtmlUrls(string json, string sourceBaseUrl, Dictionary<string, string> xhtmlUrlMap = null)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        try
-        {
-            var origin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
-            RewriteXhtmlNodes(node, origin, xhtmlUrlMap);
-        }
-        catch { }
-        return node.ToJsonString();
-    }
-
-    private static void RewriteXhtmlNodes(JsonNode node, string origin, Dictionary<string, string> xhtmlUrlMap = null)
-    {
-        if (node is JsonObject obj)
-        {
-            if (obj["propertyDataType"]?.GetValue<string>() == "PropertyXhtmlString" &&
-                obj["value"] is JsonValue val)
-            {
-                try
-                {
-                    var html = val.GetValue<string>() ?? "";
-                    if (html.Contains(origin, StringComparison.OrdinalIgnoreCase))
-                        html = html.Replace(origin, "", StringComparison.OrdinalIgnoreCase);
-                    if (xhtmlUrlMap != null)
-                        foreach (var (src, tgt) in xhtmlUrlMap)
-                            if (!string.IsNullOrEmpty(src) && !string.IsNullOrEmpty(tgt))
-                                html = html.Replace(src, tgt, StringComparison.OrdinalIgnoreCase);
-                    obj["value"] = html;
-                }
-                catch { }
-            }
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) RewriteXhtmlNodes(child, origin, xhtmlUrlMap);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) RewriteXhtmlNodes(item, origin, xhtmlUrlMap);
-        }
-    }
-
-    // Converts an absolute URL to its path component, or returns the input unchanged if
-    // it is already relative.
-    private static string ToRelativePath(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return null;
-        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            return uri.PathAndQuery;
-        return url.StartsWith('/') ? url : null;
-    }
-
-    private static List<Guid> ExtractContentReferenceGuids(string json)
-    {
-        var guids = new List<Guid>();
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            CollectGuids(doc.RootElement, guids, new HashSet<Guid>());
-        }
-        catch { /* malformed JSON — skip */ }
-        return guids;
-    }
-
-    private static void CollectGuids(JsonElement element, List<Guid> guids, HashSet<Guid> seen)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var prop in element.EnumerateObject())
-            {
-                if (prop.Name == "guidValue" &&
-                    prop.Value.ValueKind == JsonValueKind.String &&
-                    Guid.TryParse(prop.Value.GetString(), out var guid) &&
-                    seen.Add(guid))
-                    guids.Add(guid);
-
-                CollectGuids(prop.Value, guids, seen);
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                CollectGuids(item, guids, seen);
-        }
-    }
-
-    private async Task<(int? id, string targetRelUrl)> WriteAssetToTargetAsync(
-        Guid guid,
-        string originalJson,
-        string cleanJson,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        var binaryUrl = GetAssetBinaryUrl(originalJson);
-
-        if (binaryUrl == null)
-            return (await WriteToTargetAsync(guid, cleanJson, target, targetToken), null);
-
-        var client = _httpClientFactory.CreateClient();
-        LogRequest("GET (binary download)", binaryUrl, sourceToken);
-        var dlRequest = new HttpRequestMessage(HttpMethod.Get, binaryUrl);
-        dlRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-        var dlResponse = await client.SendAsync(dlRequest, HttpCompletionOption.ResponseHeadersRead);
-        _logger.LogDebug("<<< {Status} GET (binary download) {Url} — {Bytes} bytes", (int)dlResponse.StatusCode, binaryUrl, dlResponse.Content.Headers.ContentLength ?? -1);
-
-        if (!dlResponse.IsSuccessStatusCode)
-        {
-            var dlBody = await dlResponse.Content.ReadAsStringAsync();
-            LogResponse("GET (binary download)", binaryUrl, (int)dlResponse.StatusCode, dlBody);
-            _logger.LogWarning("Could not download binary for asset {Guid} from {Url} ({Status}) — transferring metadata only", guid, binaryUrl, (int)dlResponse.StatusCode);
-            return (await WriteToTargetAsync(guid, cleanJson, target, targetToken), null);
-        }
-
-        using var binaryStream = new MemoryStream();
-        await dlResponse.Content.CopyToAsync(binaryStream);
-        var mimeType = GetAssetMimeType(originalJson) ?? dlResponse.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
-        var fileName = GetAssetFileName(originalJson) ?? guid.ToString();
-
-        // Multipart PUT: "content" part = minimal JSON, "file" part = binary.
-        // Field name "file" confirmed working against EPiServer.ContentManagementApi v3.12.7.
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        var activeJson = cleanJson;
-
-        for (var attempt = 0; attempt < 10; attempt++)
-        {
-            _logger.LogDebug(">>> PUT {Url}\n    Purpose: PUT (multipart) — uploading asset binary + metadata to target\n    Content-Type: multipart/form-data\n[content part]\n{Json}\n[file part] name={FileName} mimeType={Mime} size={Bytes}",
-                url, activeJson, fileName, mimeType, binaryStream.Length);
-            var putRequest = new HttpRequestMessage(HttpMethod.Put, url);
-            putRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-
-            var multipart = new MultipartFormDataContent();
-            multipart.Add(new StringContent(activeJson, Encoding.UTF8, "application/json"), "content");
-            binaryStream.Position = 0;
-            var binaryPart = new StreamContent(binaryStream);
-            binaryPart.Headers.ContentType = new MediaTypeHeaderValue(mimeType);
-            multipart.Add(binaryPart, "file", fileName);
-            putRequest.Content = multipart;
-
-            var response = await client.SendAsync(putRequest);
-            var responseBody = await response.Content.ReadAsStringAsync();
-            LogResponse("PUT (multipart)", url, (int)response.StatusCode, responseBody);
-
-            if (response.IsSuccessStatusCode)
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(responseBody);
-                    int? id = null;
-                    string targetRelUrl = null;
-                    if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                        cl.TryGetProperty("id", out var idProp) &&
-                        idProp.ValueKind == JsonValueKind.Number)
-                        id = idProp.GetInt32();
-                    if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                        urlProp.ValueKind == JsonValueKind.String)
+                    if (badIndex.HasValue && badPropObj["value"] is JsonArray badArray && badIndex.Value >= 0 && badIndex.Value < badArray.Count)
                     {
-                        var fullUrl = urlProp.GetString() ?? "";
-                        targetRelUrl = Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
-                            ? uri.PathAndQuery
-                            : (fullUrl.StartsWith('/') ? fullUrl : null);
+                        _logger.LogDebug("Stripping array item [{Index}] from '{Prop}' on {Key} and retrying ({Attempt}/{Max})", badIndex.Value, badField, key, attempt + 1, MaxWriteAttempts);
+                        badArray.RemoveAt(badIndex.Value);
+                        failedDependencyGuids?.Add($"{key}:{badField}[{badIndex.Value}] (array item omitted — target rejected it)");
+                        continue;
                     }
-                    return (id, targetRelUrl);
-                }
-                catch { }
-                return (null, null);
-            }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
-            {
-                var unknownProp = ExtractPropertyNotFoundName(responseBody);
-                if (unknownProp != null)
-                {
-                    _logger.LogDebug("Stripping unknown asset property '{Prop}' from {Guid} and retrying", unknownProp, guid);
-                    activeJson = StripNamedProperty(activeJson, unknownProp);
+                    _logger.LogDebug("Stripping property '{Prop}' from {Key} and retrying ({Attempt}/{Max})", badField, key, attempt + 1, MaxWriteAttempts);
+                    propertiesNode.Remove(badField);
+                    failedDependencyGuids?.Add($"{key}:{badField} (property omitted — target rejected it)");
                     continue;
                 }
             }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
-            {
-                // Asset already exists on target under a different parent — use the existing version.
-                _logger.LogDebug("Asset {Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
-                var existingId = await GetTargetContentIdAsync(guid, target, targetToken);
-                string existingUrl = null;
-                var existingJson = await ReadFromTargetAsync(guid, target, targetToken);
-                if (existingJson != null)
-                {
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(existingJson);
-                        if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                            urlProp.ValueKind == JsonValueKind.String)
-                        {
-                            var fullUrl = urlProp.GetString() ?? "";
-                            existingUrl = Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
-                                ? uri.PathAndQuery
-                                : (fullUrl.StartsWith('/') ? fullUrl : null);
-                        }
-                    }
-                    catch { }
-                }
-                return (existingId, existingUrl);
-            }
-
-            throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {responseBody}");
+            throw new HttpRequestException($"HTTP {(int)resp.Status} writing {key}: {resp.Body}");
         }
 
-        throw new HttpRequestException("Asset write failed after stripping multiple unknown properties");
+        throw new HttpRequestException($"Write failed for {key} after {MaxWriteAttempts} attempts resolving property errors");
     }
 
-    private static string GetAssetBinaryUrl(string json)
+    // Re-lists versions rather than parsing the write response directly, since content_create and
+    // content_createversion return differently-shaped bodies (NewContentNode vs. bare
+    // ContentVersion) — listing is uniform for both and avoids guessing at which shape applies.
+    // The highest version number for the locale is the one just written (versions only increase).
+    private async Task PublishLatestVersionAsync(string baseUrl, string token, string key, string locale)
+    {
+        var resp = await _api.ListVersionsAsync(baseUrl, token, key, "find version to publish", locale);
+        if (!resp.IsSuccess) return;
+        var candidates = ParseVersionList(resp.Body)
+            .Where(v => string.Equals(v.Locale, locale, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (candidates.Count == 0) return;
+        var latest = candidates.OrderByDescending(v => int.TryParse(v.VersionNumber, out var n) ? n : 0).First();
+
+        var pubResp = await _api.PublishVersionAsync(baseUrl, token, key, latest.VersionNumber, "publish version");
+        if (!pubResp.IsSuccess)
+            _logger.LogWarning("Could not publish version {Version} of {Key}: HTTP {Status}: {Body}", latest.VersionNumber, key, (int)pubResp.Status, pubResp.Body);
+    }
+
+    private async Task<(byte[] bytes, string fileName, string mimeType)> DownloadMediaAsync(string sourceBaseUrl, string sourceToken, string key, SourceVersion version)
+    {
+        try
+        {
+            var (status, bytes, contentType) = await _api.GetMediaBinaryAsync(sourceBaseUrl, sourceToken, key, version.VersionNumber, "download media");
+            if (status != HttpStatusCode.OK || bytes == null) return (null, null, null);
+            var fileName = ResolveAssetFileName(version.DisplayName, version.RouteSegment, contentType);
+            return (bytes, fileName, contentType ?? "application/octet-stream");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not download media binary for {Key}: {Error}", key, ex.Message);
+            return (null, null, null);
+        }
+    }
+
+    // The new API rejects an explicit JSON null for several optional fields ("The 'X' field does
+    // not allow 'null' values.", confirmed live for routeSegment) — the key must be OMITTED
+    // entirely, not present-with-null. JsonObject's indexer sets a literal null, so every
+    // optional field goes through this instead.
+    private static void SetIfNotNull(JsonObject obj, string key, string value)
+    {
+        if (!string.IsNullOrEmpty(value)) obj[key] = value;
+    }
+
+    private static string ResolveAssetFileName(string displayName, string routeSegment, string mimeType)
+    {
+        var name = !string.IsNullOrEmpty(displayName) ? displayName : "asset";
+        if (Path.HasExtension(name)) return name;
+        var ext = !string.IsNullOrEmpty(routeSegment) ? Path.GetExtension(routeSegment) : null;
+        if (string.IsNullOrEmpty(ext)) ext = ExtensionForMimeType(mimeType);
+        return string.IsNullOrEmpty(ext) ? name : name + ext;
+    }
+
+    private static string ExtensionForMimeType(string mimeType) => mimeType?.ToLowerInvariant() switch
+    {
+        "image/jpeg" or "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "image/tiff" => ".tiff",
+        "image/x-icon" or "image/vnd.microsoft.icon" => ".ico",
+        "image/avif" => ".avif",
+        "image/heic" => ".heic",
+        "application/pdf" => ".pdf",
+        _ => null
+    };
+
+    // Rewrites inline image src/href values in RichText properties to the environment-agnostic
+    // "/link/{guid}.aspx" permalink form. This is a deliberate simplification over the CMA-era
+    // engine's xhtmlUrlMap/xhtmlContentIdMap rewriting: since content keys are preserved across
+    // environments, a permalink is ALREADY correct on the target with zero lookups — no CDV, no
+    // numeric-id remap (which isn't computable in the new API anyway; see the KNOWN GAP note at
+    // the top of this file). Only genuinely GUID-resolvable sources are rewritten (existing
+    // permalinks are left as-is; a ",,{id}" edit-mode URL is resolved locally since the source is
+    // always the environment this code runs on). A src that can't be resolved to a GUID at all
+    // (a hand-typed friendly URL with no id hint) is left completely untouched — best effort.
+    private void RewriteInlineImages(JsonObject propertiesNode)
+    {
+        WalkJsonObjects(propertiesNode, obj =>
+        {
+            if (obj["value"] is not JsonObject val || val["html"] is not JsonValue htmlVal) return;
+            string html;
+            try { html = htmlVal.GetValue<string>(); } catch { return; }
+            if (string.IsNullOrEmpty(html)) return;
+
+            var rewritten = Regex.Replace(html, @"(?:src|href)=""([^""]+)""", m =>
+            {
+                var attr = m.Value[..(m.Value.IndexOf('=') + 1)];
+                var src = m.Groups[1].Value;
+                var srcPath = src.Split('?')[0];
+
+                if (srcPath.StartsWith("/link/", StringComparison.OrdinalIgnoreCase) && srcPath.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase))
+                    return m.Value; // already a permalink — nothing to do
+
+                var idMatch = Regex.Match(srcPath, @",,(\d+)");
+                if (!idMatch.Success) return m.Value; // no id hint — best-effort leave as-is
+
+                Guid guid;
+                try
+                {
+                    var content = _contentLoader.Get<IContent>(new ContentReference(int.Parse(idMatch.Groups[1].Value)), LanguageSelector.AutoDetect(true));
+                    guid = content?.ContentGuid ?? Guid.Empty;
+                }
+                catch { return m.Value; }
+                if (guid == Guid.Empty) return m.Value;
+
+                return $"{attr}\"/link/{guid:D}.aspx\"";
+            });
+
+            if (!string.Equals(rewritten, html, StringComparison.Ordinal))
+                val["html"] = rewritten;
+        });
+    }
+
+    // ── JSON extraction helpers for the new REST API's shapes ──────────────────
+
+    private sealed class SourceVersion
+    {
+        public string Locale;
+        public string VersionNumber;
+        public string DisplayName;
+        public string RouteSegment;
+        public string PropertiesJson;
+    }
+
+    private static List<SourceVersion> ParseVersionList(string json)
+    {
+        var list = new List<SourceVersion>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) return list;
+            foreach (var item in items.EnumerateArray())
+            {
+                list.Add(new SourceVersion
+                {
+                    Locale = item.TryGetProperty("locale", out var l) ? l.GetString() : null,
+                    VersionNumber = item.TryGetProperty("version", out var v) ? v.ToString() : null,
+                    DisplayName = item.TryGetProperty("displayName", out var d) ? d.GetString() : null,
+                    RouteSegment = item.TryGetProperty("routeSegment", out var r) ? r.GetString() : null,
+                    PropertiesJson = item.TryGetProperty("properties", out var p) ? p.GetRawText() : "{}"
+                });
+            }
+        }
+        catch { }
+        return list;
+    }
+
+    // Walks a version's `properties` object for content references: a single reference
+    // ({"value": "cms://content/{key}"}) or a ContentArea ({"value": [{"reference": "cms://
+    // content/{key}"}, ...]}). Embedded/inline components ({"value": {"properties": {...}}}, no
+    // "reference" key) are deliberately NOT walked here — they're inline data, not separate
+    // transferable content (their own nested references, if any, would need the containing
+    // property's value walked recursively; not currently needed by any content type in this
+    // deployment's schema, so not implemented — see CLAUDE.md known gaps).
+    internal static List<Guid> ExtractPropertyReferenceGuids(string propertiesJson)
+    {
+        var guids = new List<Guid>();
+        var seen = new HashSet<Guid>();
+        try
+        {
+            using var doc = JsonDocument.Parse(propertiesJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return guids;
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (!prop.Value.TryGetProperty("value", out var val)) continue;
+                CollectReferenceGuids(val, guids, seen);
+            }
+        }
+        catch { }
+        return guids;
+    }
+
+    private static void CollectReferenceGuids(JsonElement value, List<Guid> guids, HashSet<Guid> seen)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.String:
+                if (TryParseContentUri(value.GetString(), out var g) && seen.Add(g)) guids.Add(g);
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in value.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("reference", out var r) && r.ValueKind == JsonValueKind.String)
+                    {
+                        if (TryParseContentUri(r.GetString(), out var g2) && seen.Add(g2)) guids.Add(g2);
+                    }
+                    else if (item.ValueKind == JsonValueKind.String)
+                    {
+                        if (TryParseContentUri(item.GetString(), out var g3) && seen.Add(g3)) guids.Add(g3);
+                    }
+                }
+                break;
+        }
+    }
+
+    private const string ContentUriPrefix = "cms://content/";
+
+    private static bool TryParseContentUri(string value, out Guid guid)
+    {
+        guid = Guid.Empty;
+        if (string.IsNullOrEmpty(value) || !value.StartsWith(ContentUriPrefix, StringComparison.OrdinalIgnoreCase)) return false;
+        return Guid.TryParseExact(value[ContentUriPrefix.Length..], "N", out guid);
+    }
+
+    // Matches the permalink format RewriteInlineImages writes ("/link/{guid:D}.aspx") and that
+    // source rich-text content already uses natively (confirmed live). Query string is stripped
+    // by the caller (ExtractXhtmlImageUrls returns the raw src/href, including any "?" suffix).
+    private static readonly Regex PermalinkGuidRegex = new(
+        @"/link/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.aspx",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static bool TryParsePermalinkGuid(string url, out Guid guid)
+    {
+        guid = Guid.Empty;
+        if (string.IsNullOrEmpty(url)) return false;
+        var path = url.Split('?')[0];
+        var m = PermalinkGuidRegex.Match(path);
+        return m.Success && Guid.TryParse(m.Groups[1].Value, out guid);
+    }
+
+    // 32-char lowercase-hex key (no dashes) ↔ Guid. This IS the identity-preservation strategy:
+    // every item is created on the target with key == ToKey(sourceGuid).
+    internal static string ToKey(Guid guid) => guid.ToString("N");
+    private static Guid ToGuid(string key) => Guid.TryParseExact(key, "N", out var g) ? g : Guid.Empty;
+
+    private static string ExtractStringField(string json, string field)
     {
         try
         {
             using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!IsMediaContent(root)) return null;
-            if (root.TryGetProperty("language", out var lang) &&
-                lang.TryGetProperty("link", out var link) &&
-                link.ValueKind == JsonValueKind.String)
-                return link.GetString();
+            return doc.RootElement.TryGetProperty(field, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
         }
-        catch { }
-        return null;
+        catch { return null; }
     }
 
-    // Ensures a content item (typically a shared folder) exists on target, creating it from
-    // source if not. Recurses up the ancestry so the full folder chain is created bottom-up.
-    // `seen` prevents re-entering GUIDs already in progress (guards against loops).
-    private async Task EnsureContentParentAsync(
-        Guid parentGuid,
-        string sourceBaseUrl,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken,
-        HashSet<Guid> seen)
+    private static bool TryExtractStringField(string json, string field, out string value)
     {
-        if (seen != null && seen.Contains(parentGuid)) return;
-        if (await ExistsOnTargetAsync(parentGuid, target, targetToken)) return;
+        value = ExtractStringField(json, field);
+        return !string.IsNullOrEmpty(value);
+    }
 
-        seen ??= new HashSet<Guid>();
-        seen.Add(parentGuid);
+    private static Guid? ExtractGuidField(string json, string field) =>
+        TryExtractStringField(json, field, out var s) && Guid.TryParseExact(s, "N", out var g) ? g : null;
 
+    private static List<string> ExtractStringArrayField(string json, string field)
+    {
+        var list = new List<string>();
         try
         {
-            var json = await ReadFromSourceAsync(parentGuid, sourceBaseUrl, sourceToken);
-            // Ensure this item's own parent exists first (depth-first up the tree)
-            var grandparentGuid = ExtractParentGuid(json);
-            if (grandparentGuid.HasValue)
-                await EnsureContentParentAsync(grandparentGuid.Value, sourceBaseUrl, sourceToken, target, targetToken, seen);
-            var cleanJson = StripReadOnlyProperties(json, preserveParentLink: true);
-            await WriteToTargetAsync(parentGuid, cleanJson, target, targetToken);
-            _logger.LogDebug("Created missing parent {Guid} on target", parentGuid);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty(field, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                foreach (var item in arr.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.String) list.Add(item.GetString());
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("Could not create missing parent {Guid} on target: {Error}", parentGuid, ex.Message);
-        }
+        catch { }
+        return list;
     }
 
-    // Filters out CMS system pages (Root=1, Waste Basket=2) that are never meaningful
-    // user content and should not appear in the dependency plan.
-    private static bool IsSystemContentReference(ContentReference contentRef) =>
-        !ContentReference.IsNullOrEmpty(contentRef) &&
-        (contentRef.ID == ContentReference.RootPage.ID ||
-         contentRef.ID == ContentReference.WasteBasket.ID);
+    // Detects a routeSegment uniqueness conflict regardless of casing/prefix — confirmed live in
+    // two shapes: "initialVersion.RouteSegment" (content_create) and presumably bare
+    // "routeSegment" (content_createversion, matching the lowercase field name PatchVersionAsync/
+    // CreateVersionAsync send). Matching on the field's last segment name rather than the error
+    // detail text keeps this robust to wording changes in the API's message.
+    private static bool HasRouteSegmentConflict(string errorBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(errorBody);
+            if (!doc.RootElement.TryGetProperty("errors", out var errors) || errors.ValueKind != JsonValueKind.Array) return false;
+            foreach (var err in errors.EnumerateArray())
+            {
+                if (!err.TryGetProperty("field", out var f) || f.ValueKind != JsonValueKind.String) continue;
+                var field = f.GetString() ?? "";
+                var lastDot = field.LastIndexOf('.');
+                var shortName = lastDot >= 0 ? field[(lastDot + 1)..] : field;
+                if (string.Equals(shortName, "routeSegment", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
 
-    // Filters out Optimizely built-in PropertyContentReference properties that hold
-    // structural/navigational links (parent, shortcut target, archive location) rather
-    // than user-created content dependencies.
+    private static readonly Regex TopLevelArrayIndexRegex = new(@"^value\[(\d+)\]", RegexOptions.Compiled);
+
+    // Pulls the offending property's short name (and, when the bad value is one element of a
+    // ContentArea, that element's array index) out of a 400 response's structured `errors` array
+    // — e.g. {"errors":[{"field":"initialVersion.properties.Heading","detail":"..."}]} or
+    // {"field":"properties.Image", ...} for a version write. Much simpler than CMA's message-
+    // string regex matching: the new API always names the exact field.
+    private static (string PropertyName, int? ArrayIndex) ExtractOffendingField(string errorBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(errorBody);
+            if (!doc.RootElement.TryGetProperty("errors", out var errors) || errors.ValueKind != JsonValueKind.Array) return (null, null);
+            foreach (var err in errors.EnumerateArray())
+            {
+                if (!err.TryGetProperty("field", out var f) || f.ValueKind != JsonValueKind.String) continue;
+                var field = f.GetString() ?? "";
+                const string marker = "properties.";
+                // FIRST occurrence, not last: a field path can contain "properties." more than
+                // once when the bad value sits inside an embedded component nested inside a
+                // ContentArea item — e.g. confirmed live:
+                // "initialVersion.properties.RelatedContentArea.value[2].properties.Image.value".
+                // LastIndexOf found the INNER "properties." (right before "Image"), extracting
+                // "Image" — no top-level property is named that, so ContainsKey missed and the
+                // whole strip-and-retry loop was defeated again, just one level deeper than the
+                // first time this bug was found (that fix only handled the single-"properties."
+                // case, e.g. "initialVersion.properties.PageImage.value"). Anchoring on the FIRST
+                // "properties." and taking only the next segment correctly yields the top-level
+                // key ("RelatedContentArea") regardless of nesting depth.
+                var idx = field.IndexOf(marker, StringComparison.Ordinal);
+                if (idx < 0) continue;
+                var afterProperties = field[(idx + marker.Length)..];
+                var dotIndex = afterProperties.IndexOf('.');
+                var propName = dotIndex >= 0 ? afterProperties[..dotIndex] : afterProperties;
+
+                // If the remainder immediately after "PropName." is "value[N]", the error is
+                // scoped to one ContentArea element rather than the whole property — capture N so
+                // the caller can drop just that element (see the array-item strip fix at the call
+                // site: stripping the whole property here was destroying sibling items that were
+                // perfectly fine — confirmed live with a 3-item ContentArea reduced to 0 items
+                // because only 1 of the 3 was actually bad).
+                int? arrayIndex = null;
+                if (dotIndex >= 0)
+                {
+                    var rest = afterProperties[(dotIndex + 1)..];
+                    var m = TopLevelArrayIndexRegex.Match(rest);
+                    if (m.Success) arrayIndex = int.Parse(m.Groups[1].Value);
+                }
+
+                return (propName, arrayIndex);
+            }
+        }
+        catch { }
+        return (null, null);
+    }
+
+    // Content-kind classification via the LOCAL content-type repository (already an injected
+    // dependency) rather than any new API surface — we already know the type NAME from the
+    // node's `contentType` field, and IContentTypeRepository maps that to the real .NET model
+    // type, exactly the same distinction ScanContentDependencies already relies on locally.
+    private bool IsMediaContentType(string contentTypeName) => ModelTypeImplements(contentTypeName, typeof(IContentMedia));
+    private bool IsPageContentType(string contentTypeName) => ModelTypeImplements(contentTypeName, typeof(PageData));
+    private bool IsBlockContentType(string contentTypeName) => !IsMediaContentType(contentTypeName) && !IsPageContentType(contentTypeName) && ModelTypeImplements(contentTypeName, typeof(BlockData));
+
+    private bool ModelTypeImplements(string contentTypeName, Type expected)
+    {
+        if (string.IsNullOrEmpty(contentTypeName)) return false;
+        try
+        {
+            var ct = _contentTypeRepository.Load(contentTypeName);
+            return ct?.ModelType != null && expected.IsAssignableFrom(ct.ModelType);
+        }
+        catch { return false; }
+    }
+
+    // Filters out CMS system pages (Root=1, Waste Basket=2).
+    private static bool IsSystemContentReference(ContentReference contentRef) =>
+        !ContentReference.IsNullOrEmpty(contentRef) && (contentRef.ID == ContentReference.RootPage.ID || contentRef.ID == ContentReference.WasteBasket.ID);
+
     private static readonly HashSet<string> SystemPropertyNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "PageParentLink", "PageShortcutLink", "PageArchiveLink", "PageDeletedLink"
     };
 
-    private static bool IsSystemPropertyName(string propName) =>
-        !string.IsNullOrEmpty(propName) && SystemPropertyNames.Contains(propName);
+    private static bool IsSystemPropertyName(string propName) => !string.IsNullOrEmpty(propName) && SystemPropertyNames.Contains(propName);
 
     private static string GetMediaNodeType(string name)
     {
         var ext = Path.GetExtension(name ?? "").TrimStart('.').ToLowerInvariant();
-        if (ext is "jpg" or "jpeg" or "png" or "gif" or "bmp" or "webp" or "svg" or "ico" or "tiff" or "tif" or "heic" or "heif" or "avif")
-            return "Image";
-        if (ext is "mp4" or "mov" or "avi" or "mkv" or "wmv" or "flv" or "webm" or "m4v" or "mpg" or "mpeg" or "m2v" or "3gp" or "3g2" or "ogv" or "mts" or "m2ts")
-            return "Video";
-        if (ext is "mp3" or "wav" or "ogg" or "flac" or "aac" or "m4a" or "wma" or "opus" or "aiff" or "mid" or "midi")
-            return "Audio";
-        if (ext is "pdf" or "doc" or "docx" or "xls" or "xlsx" or "ppt" or "pptx" or "odt" or "ods" or "odp" or "rtf" or "txt" or "csv" or "pages" or "numbers" or "keynote" or "epub")
-            return "Document";
+        if (ext is "jpg" or "jpeg" or "png" or "gif" or "bmp" or "webp" or "svg" or "ico" or "tiff" or "tif" or "heic" or "heif" or "avif") return "Image";
+        if (ext is "mp4" or "mov" or "avi" or "mkv" or "wmv" or "flv" or "webm" or "m4v" or "mpg" or "mpeg" or "m2v" or "3gp" or "3g2" or "ogv" or "mts" or "m2ts") return "Video";
+        if (ext is "mp3" or "wav" or "ogg" or "flac" or "aac" or "m4a" or "wma" or "opus" or "aiff" or "mid" or "midi") return "Audio";
+        if (ext is "pdf" or "doc" or "docx" or "xls" or "xlsx" or "ppt" or "pptx" or "odt" or "ods" or "odp" or "rtf" or "txt" or "csv" or "pages" or "numbers" or "keynote" or "epub") return "Document";
         return "UnknownMedia";
-    }
-
-    private static Guid? ExtractParentGuid(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("parentLink", out var pl) &&
-                pl.TryGetProperty("guidValue", out var gv) &&
-                Guid.TryParse(gv.GetString(), out var guid))
-                return guid;
-        }
-        catch { }
-        return null;
-    }
-
-    private static string ExtractPropertyNotFoundName(string errorBody)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(errorBody);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("code", out var code) &&
-                code.GetString() == "PropertyNotFound" &&
-                root.TryGetProperty("detail", out var detail))
-            {
-                var msg = detail.GetString() ?? "";
-                var start = msg.IndexOf('\'') + 1;
-                var end = msg.IndexOf('\'', start);
-                if (start > 0 && end > start) return msg[start..end];
-            }
-        }
-        catch { }
-        return null;
-    }
-
-    // Detects {"code":"InvalidContent","detail":"Property 'X' is required."} errors and
-    // returns the property name so the caller can strip it and defer it for a second pass.
-    private static string ExtractInvalidContentPropertyName(string errorBody)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(errorBody);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("code", out var code) ||
-                !string.Equals(code.GetString(), "InvalidContent", StringComparison.OrdinalIgnoreCase))
-                return null;
-            if (!root.TryGetProperty("detail", out var detail)) return null;
-            var msg = detail.GetString() ?? "";
-            var start = msg.IndexOf('\'') + 1;
-            var end = msg.IndexOf('\'', start);
-            if (start > 0 && end > start) return msg[start..end];
-        }
-        catch { }
-        return null;
-    }
-
-    // Returns the first content GUID referenced inside a CMA property value node,
-    // so the deferred-patch pass can check whether that content now exists on the target.
-    private static Guid? ExtractReferencedContentGuid(string propertyJson)
-    {
-        try
-        {
-            var node = JsonNode.Parse(propertyJson)?.AsObject();
-            if (node == null) return null;
-            // PropertyContentReference: { value: { guidValue: "..." } }
-            if (node["value"] is JsonObject val)
-            {
-                if (Guid.TryParse(val["guidValue"]?.GetValue<string>(), out var g)) return g;
-            }
-            // PropertyContentArea: { value: [ { contentLink: { guidValue: "..." } } ] }
-            if (node["value"] is JsonArray arr && arr.Count > 0)
-            {
-                var cl = arr[0]?.AsObject()?["contentLink"]?.AsObject();
-                if (cl != null && Guid.TryParse(cl["guidValue"]?.GetValue<string>(), out var g2)) return g2;
-            }
-        }
-        catch { }
-        return null;
-    }
-
-    // Returns a fallback GUID for a property whose referenced content doesn't exist on the target.
-    // Page references → start page GUID (same across all environments in DXP).
-    // Block/media references → a PLACEHOLDER copy created in the target page's asset folder.
-    private async Task<string> GetFallbackReferenceGuidAsync(
-        string propertyJson,
-        Guid? sourceRefGuid,
-        Guid pageTargetGuid,
-        string sourceBaseUrl,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        // Determine whether the referenced content is a page
-        bool isPage = false;
-        if (sourceRefGuid.HasValue)
-        {
-            try
-            {
-                var srcJson = await ReadFromSourceAsync(sourceRefGuid.Value, sourceBaseUrl, sourceToken);
-                using var doc = JsonDocument.Parse(srcJson);
-                isPage = IsPageContent(doc.RootElement);
-            }
-            catch { }
-        }
-        else
-        {
-            // Fall back to property data type
-            try
-            {
-                var pdt = JsonNode.Parse(propertyJson)?.AsObject()?["propertyDataType"]?.GetValue<string>();
-                isPage = pdt == "PropertyContentReference";
-            }
-            catch { }
-        }
-
-        if (isPage)
-        {
-            // Use the site start page — its GUID is identical on all DXP environments
-            var (startGuid, _) = GetSiteRootFallback();
-            if (startGuid.HasValue && await ExistsOnTargetAsync(startGuid.Value, target, targetToken))
-                return startGuid.Value.ToString();
-            return null;
-        }
-
-        // Block or media — create a PLACEHOLDER in the target page's asset folder
-        return sourceRefGuid.HasValue
-            ? await CreatePlaceholderAsync(sourceRefGuid.Value, pageTargetGuid, sourceBaseUrl, sourceToken, target, targetToken)
-            : null;
-    }
-
-    // Creates a minimal PLACEHOLDER content item on the target using the source item's content type.
-    private async Task<string> CreatePlaceholderAsync(
-        Guid sourceRefGuid,
-        Guid pageTargetGuid,
-        string sourceBaseUrl,
-        string sourceToken,
-        DxpEnvironmentConfig target,
-        string targetToken)
-    {
-        try
-        {
-            var srcJson = await ReadFromSourceAsync(sourceRefGuid, sourceBaseUrl, sourceToken);
-            string stubJson;
-            using (var doc = JsonDocument.Parse(srcJson))
-            {
-                stubJson = IsMediaContent(doc.RootElement)
-                    ? BuildMinimalAssetJson(srcJson, pageTargetGuid)
-                    : BuildMinimalContentJson(srcJson, pageTargetGuid);
-            }
-
-            var stubNode = JsonNode.Parse(stubJson)?.AsObject();
-            if (stubNode == null) return null;
-            stubNode["name"] = "PLACEHOLDER";
-            stubNode["status"] = "Published";
-
-            var placeholderGuid = Guid.NewGuid();
-            await WriteToTargetAsync(placeholderGuid, stubNode.ToJsonString(), target, targetToken);
-            _logger.LogDebug("Created PLACEHOLDER for missing {SourceGuid} under page {Page}", sourceRefGuid, pageTargetGuid);
-            return placeholderGuid.ToString();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("Could not create PLACEHOLDER for {SourceGuid}: {Error}", sourceRefGuid, ex.Message);
-            return null;
-        }
-    }
-
-    private static JsonNode BuildFallbackPropertyValue(string propertyJson, string fallbackGuid)
-    {
-        try
-        {
-            var node = JsonNode.Parse(propertyJson)?.AsObject();
-            if (node == null) return null;
-            var pdt = node["propertyDataType"]?.GetValue<string>();
-            if (pdt == "PropertyContentReference")
-                node["value"] = new JsonObject { ["guidValue"] = fallbackGuid };
-            else if (pdt == "PropertyContentArea")
-                node["value"] = new JsonArray { new JsonObject { ["contentLink"] = new JsonObject { ["guidValue"] = fallbackGuid }, ["displayOption"] = "" } };
-            return node;
-        }
-        catch { }
-        return null;
-    }
-
-    private static string ExtractNamedPropertyJson(string json, string propertyName)
-    {
-        try
-        {
-            var node = JsonNode.Parse(json)?.AsObject();
-            if (node != null && node[propertyName] is JsonNode val)
-                return val.ToJsonString();
-        }
-        catch { }
-        return null;
-    }
-
-    private async Task<string> ReadFromTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        if (!response.IsSuccessStatusCode) return null;
-        return await response.Content.ReadAsStringAsync();
-    }
-
-    private static string StripNamedProperty(string json, string propertyName)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        node.Remove(propertyName);
-        return node.ToJsonString();
-    }
-
-    // Returns true if the content is page-local (url contains /contentassets/).
-    // Local content goes under the page's own "For This Page" bucket.
-    // Global content (/globalassets/ or no URL) preserves its source parentLink.
-    private static bool IsLocalContent(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-                return (urlProp.GetString() ?? "").Contains("/contentassets/", StringComparison.OrdinalIgnoreCase);
-        }
-        catch { }
-        return false; // no URL → treat as global, preserve parentLink
-    }
-
-    // Block detection: we treat anything that is NOT media and NOT a page as block-like.
-    // Checking for the literal string "Block" in contentType is too narrow — Shared Blocks
-    // and custom shared content types don't always carry "Block" in their type hierarchy,
-    // so they would silently fall through to the page-reference path and skip XHTML scanning.
-    private static bool IsBlockContent(JsonElement root) =>
-        !IsMediaContent(root) && !IsPageContent(root);
-
-    private static bool IsPageContent(JsonElement root)
-    {
-        if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
-            foreach (var item in ct.EnumerateArray())
-                if (item.ValueKind == JsonValueKind.String &&
-                    string.Equals(item.GetString(), "Page", StringComparison.OrdinalIgnoreCase))
-                    return true;
-        return false;
-    }
-
-    private static bool IsMediaContent(JsonElement root)
-    {
-        if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
-            foreach (var item in ct.EnumerateArray())
-                if (item.ValueKind == JsonValueKind.String &&
-                    string.Equals(item.GetString(), "Media", StringComparison.OrdinalIgnoreCase))
-                    return true;
-        return false;
-    }
-
-
-    // Builds the minimal JSON body for a page or block stub — just enough for Optimizely to create
-    // the item and auto-generate its "For This Page/Block" asset folder on the target.
-    private static string BuildMinimalContentJson(string sourceJson, Guid parentGuid, string status = "CheckedOut")
-    {
-        string name = null;
-        string language = null;
-        var contentTypes = new JsonArray();
-        try
-        {
-            using var doc = JsonDocument.Parse(sourceJson);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("name", out var nameProp))
-                name = nameProp.GetString();
-            if (root.TryGetProperty("language", out var langProp) && langProp.ValueKind == JsonValueKind.Object &&
-                langProp.TryGetProperty("name", out var langName))
-                language = langName.GetString();
-            if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
-                foreach (var item in ct.EnumerateArray())
-                    if (item.ValueKind == JsonValueKind.String && item.GetString() is string s)
-                        contentTypes.Add(s);
-        }
-        catch { }
-
-        var obj = new JsonObject
-        {
-            ["parentLink"] = new JsonObject { ["guidValue"] = parentGuid.ToString("D") },
-            ["name"] = name ?? "content",
-            ["status"] = status,
-            ["contentType"] = contentTypes
-        };
-        if (!string.IsNullOrEmpty(language))
-            obj["language"] = new JsonObject { ["name"] = language };
-        return obj.ToJsonString();
-    }
-
-    // Builds the minimal JSON body that the Content Management API needs to create/update an asset.
-    // Full source metadata causes 400s; only parentLink, the leaf contentType, name and status are required.
-    private static string BuildMinimalAssetJson(string sourceJson, Guid parentGuid, string status = "Published")
-    {
-        string name = null;
-        string leafContentType = null;
-        try
-        {
-            using var doc = JsonDocument.Parse(sourceJson);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("name", out var nameProp))
-                name = nameProp.GetString();
-            if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
-            {
-                // Take the last (most-specific) type — e.g. ["Image","Media","ImageFile"] → "ImageFile"
-                foreach (var item in ct.EnumerateArray())
-                    if (item.ValueKind == JsonValueKind.String)
-                        leafContentType = item.GetString();
-            }
-        }
-        catch { }
-
-        var obj = new JsonObject
-        {
-            ["parentLink"] = new JsonObject { ["guidValue"] = parentGuid.ToString("D") },
-            ["name"] = name ?? "asset",
-            ["status"] = status
-        };
-        if (!string.IsNullOrEmpty(leafContentType))
-            obj["contentType"] = new JsonArray(leafContentType);
-
-        return obj.ToJsonString();
-    }
-
-    private static string GetAssetMimeType(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("mimeType", out var mime) &&
-                mime.TryGetProperty("value", out var val) &&
-                val.ValueKind == JsonValueKind.String)
-                return val.GetString();
-        }
-        catch { }
-        return null;
-    }
-
-    private static string GetAssetFileName(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("name", out var name) &&
-                name.ValueKind == JsonValueKind.String)
-                return name.GetString();
-        }
-        catch { }
-        return null;
-    }
-
-    private async Task<int?> WriteToTargetAsync(Guid guid, string contentJson, DxpEnvironmentConfig target, string token,
-        List<(Guid guid, string property, string json)> deferredPatches = null,
-        string sourceBaseUrl = null, string sourceToken = null)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        var activeJson = contentJson;
-        var strippedProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        for (var attempt = 0; attempt < 25; attempt++)
-        {
-            LogRequest("PUT", url, token, activeJson);
-            var request = new HttpRequestMessage(HttpMethod.Put, url)
-            {
-                Content = new StringContent(activeJson, Encoding.UTF8, "application/json")
-            };
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            var response = await client.SendAsync(request);
-            var body = await response.Content.ReadAsStringAsync();
-            LogResponse("PUT", url, (int)response.StatusCode, body);
-
-            if (response.IsSuccessStatusCode)
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(body);
-                    if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                        cl.TryGetProperty("id", out var idProp) &&
-                        idProp.ValueKind == JsonValueKind.Number)
-                        return idProp.GetInt32();
-                }
-                catch { }
-                return null;
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
-            {
-                var unknownProp = ExtractPropertyNotFoundName(body);
-                if (unknownProp != null)
-                {
-                    // If we've already tried stripping this property name and the error
-                    // repeats, the property is nested (not at root level) so StripNamedProperty
-                    // was a no-op. Throw the real error rather than looping indefinitely.
-                    if (!strippedProps.Add(unknownProp))
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-
-                    _logger.LogDebug("Stripping unknown property '{Prop}' from {Guid} and retrying", unknownProp, guid);
-                    activeJson = StripNamedProperty(activeJson, unknownProp);
-                    continue;
-                }
-
-                var requiredProp = ExtractInvalidContentPropertyName(body);
-                if (requiredProp != null)
-                {
-                    var propJson = ExtractNamedPropertyJson(activeJson, requiredProp);
-
-                    // If the property doesn't exist at root level it is nested inside a
-                    // PropertyBlock. StripNamedProperty would be a no-op and we'd loop
-                    // forever — throw the real error instead so the caller gets a clear message.
-                    if (propJson == null)
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-
-                    // If we've already tried this property and still get the same error the
-                    // strip didn't take effect — bail rather than looping.
-                    if (!strippedProps.Add(requiredProp))
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-
-                    // Try to substitute a fallback value so the content can be written.
-                    // Page references → site root; block/media references → placeholder copy.
-                    if (!string.IsNullOrEmpty(sourceBaseUrl) && !string.IsNullOrEmpty(sourceToken))
-                    {
-                        try
-                        {
-                            var sourceRefGuid = ExtractReferencedContentGuid(propJson);
-                            var fallbackGuid = await GetFallbackReferenceGuidAsync(
-                                propJson, sourceRefGuid, guid,
-                                sourceBaseUrl, sourceToken, target, token);
-                            if (!string.IsNullOrEmpty(fallbackGuid))
-                            {
-                                var fallbackNode = BuildFallbackPropertyValue(propJson, fallbackGuid);
-                                if (fallbackNode != null)
-                                {
-                                    var node = JsonNode.Parse(activeJson)?.AsObject();
-                                    if (node != null)
-                                    {
-                                        node[requiredProp] = fallbackNode;
-                                        activeJson = node.ToJsonString();
-                                        _logger.LogDebug("Required property '{Prop}' on {Guid} — substituted fallback {FallbackGuid}", requiredProp, guid, fallbackGuid);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning("Could not build fallback for required property '{Prop}' on {Guid}: {Error}", requiredProp, guid, ex.Message);
-                        }
-                    }
-
-                    // No fallback available — strip the property and defer for a second pass.
-                    if (deferredPatches != null)
-                    {
-                        deferredPatches.Add((guid, requiredProp, propJson));
-                        _logger.LogDebug("Deferring required property '{Prop}' on {Guid}", requiredProp, guid);
-                    }
-                    activeJson = StripNamedProperty(activeJson, requiredProp);
-                    continue;
-                }
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
-            {
-                // Content already exists on target under a different parent — use the existing version.
-                _logger.LogDebug("{Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
-                return await GetTargetContentIdAsync(guid, target, token);
-            }
-
-            throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-        }
-
-        throw new HttpRequestException("Write failed after stripping multiple unknown properties");
     }
 
     private (Guid? guid, string path) GetSiteRootFallback()
@@ -2548,15 +1680,44 @@ public class ContentTransferService : IContentTransferService
         catch { return (null, null); }
     }
 
-    private bool IsSiteRootGuid(Guid guid)
+    // BUG FIX: the destination-tree picker used to root itself at GetSiteRootFallback()'s node (the
+    // site's Start page) — reasonable as PreCheck's own "nothing else resolved" fallback PARENT for
+    // ordinary content, but wrong as the tree's browsing root: confirmed live, transferring the Start
+    // page itself offered "Place Under Start" as the default, i.e. placing Start under itself, when
+    // the actually-correct parent is the true CMS root ("Root" in the Pages tree, one level above
+    // Start). ContentReference.RootPage (id 1) is a system node EPiServer seeds identically across
+    // every environment of the same site, so it key-preserves exactly like Start/WasteBasket already
+    // do elsewhere in this file — safe to use as the tree's top without any new configuration.
+    private (Guid? guid, string path) GetTreeRootFallback()
     {
         try
         {
-            var startRef = SiteDefinition.Current?.StartPage ?? ContentReference.StartPage;
-            if (ContentReference.IsNullOrEmpty(startRef)) return false;
-            return _contentLoader.Get<IContent>(startRef, LanguageSelector.AutoDetect(true)).ContentGuid == guid;
+            var rootRef = ContentReference.RootPage;
+            if (ContentReference.IsNullOrEmpty(rootRef)) return (null, null);
+            var root = _contentLoader.Get<IContent>(rootRef, LanguageSelector.AutoDetect(true));
+            return (root.ContentGuid, root.Name);
         }
-        catch { return false; }
+        catch { return (null, null); }
+    }
+
+    private List<ContentReference> CollectItems(ContentReference root, bool includeChildren)
+    {
+        var items = new List<ContentReference> { root };
+        if (!includeChildren) return items;
+        try
+        {
+            void AddChildren(ContentReference parent)
+            {
+                foreach (var child in _contentLoader.GetChildren<IContent>(parent))
+                {
+                    items.Add(child.ContentLink);
+                    if (child is PageData) AddChildren(child.ContentLink);
+                }
+            }
+            AddChildren(root);
+        }
+        catch (Exception ex) { _logger.LogDebug("Could not enumerate children of {Root}: {Error}", root, ex.Message); }
+        return items;
     }
 
     private static DxpEnvironmentConfig ResolveEnvironment(DxpTransferSettings settings, string name) =>
@@ -2568,15 +1729,5 @@ public class ContentTransferService : IContentTransferService
             _ => null
         };
 
-    private static ContentReference ParseContentReference(string id)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-            return ContentReference.EmptyReference;
-
-        var parts = id.Split('_', ':');
-        if (int.TryParse(parts[0], out var contentId))
-            return new ContentReference(contentId);
-
-        return ContentReference.EmptyReference;
-    }
+    private static ContentReference ParseContentReference(string id) => ContentReferenceParser.Parse(id);
 }

@@ -20,24 +20,39 @@
             background: #fff;
         }
         h3 { font-size: 14px; font-weight: 600; margin: 0 0 6px; color: #1a1a1a; }
-        .page-name { font-size: 13px; color: #555; margin-bottom: 12px; word-break: break-word; }
-        .env-badge {
-            display: inline-block; font-size: 12px; font-weight: 500;
+        .page-name { font-size: 14px; color: #555; margin-bottom: 12px; word-break: break-word; }
+        .root-name {
+            display: inline-block; font-size: 14px; font-weight: 500;
             background: #e8f0fb; color: #2973c3; padding: 2px 8px;
-            border-radius: 10px; margin-bottom: 12px;
+            border-radius: 10px; margin-left: 4px; vertical-align: middle;
         }
-        label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: #333; }
+        .section-title { font-size: 14px; font-weight: 600; color: #1a1a1a; margin: 14px 0 10px; }
+        label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }
         select {
             width: 100%; padding: 6px 8px; border: 1px solid #bbb;
             border-radius: 3px; font-size: 14px; margin-bottom: 12px;
             background: #fff; color: #1a1a1a;
         }
         select:focus { outline: none; border-color: #2973c3; box-shadow: 0 0 0 2px rgba(41,115,195,0.2); }
-        .checkbox-row { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
-        .checkbox-row label { margin: 0; font-weight: 400; font-size: 13px; }
+        .checkbox-row { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; position: relative; }
+        .checkbox-row label { margin: 0; font-weight: 400; font-size: 14px; }
+        /* (?) help icon + hover/focus tooltip, styled after the Optimizely field-help affordance. */
+        .help {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 15px; height: 15px; border-radius: 50%; border: 1px solid #999;
+            color: #777; font-size: 11px; font-weight: 600; line-height: 1;
+            cursor: help; flex-shrink: 0;
+        }
+        .help:hover, .help:focus { border-color: #2973c3; color: #2973c3; outline: none; }
+        .help-bubble {
+            display: none; position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0;
+            background: #333; color: #fff; font-size: 12px; font-weight: 400; line-height: 1.45;
+            padding: 7px 9px; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        }
+        .help:hover .help-bubble, .help:focus .help-bubble { display: block; }
         .radio-group { margin-bottom: 12px; }
         .radio-group .radio-row { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-        .radio-group .radio-row label { margin: 0; font-weight: 400; font-size: 13px; }
+        .radio-group .radio-row label { margin: 0; font-weight: 400; font-size: 14px; }
         .divider { border: none; border-top: 1px solid #e5e5e5; margin: 10px 0; }
         button {
             width: 100%; padding: 8px 12px; background: #2973c3; color: #fff;
@@ -52,17 +67,34 @@
         .btn-cancel:hover { background: #444 !important; }
         .result {
             margin-top: 12px; padding: 9px 11px; border-radius: 3px;
-            font-size: 13px; display: none; white-space: pre-wrap; line-height: 1.5;
+            font-size: 14px; display: none; white-space: pre-wrap; line-height: 1.5;
         }
-        .result.success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
-        .result.partial { background: #fff8e1; color: #7a5500; border: 1px solid #ffe082; }
+        .result.success, .result-overlay.success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
+        .result.partial, .result-overlay.partial { background: #fff8e1; color: #7a5500; border: 1px solid #ffe082; }
         .result.error   { background: #fdecea; color: #b71c1c; border: 1px solid #ef9a9a; }
+        /* Completion summary shown in place of the plan table (the table is hidden, not removed,
+           while this shows — see showResultWithLinks/dismissResult) rather than the two being
+           stacked, so the box is always sized to its own content instead of stretching to match
+           whatever height the table happened to have. Dismiss with the close button to bring the
+           table (and its row-by-row ✓/✗ detail) back. */
+        #dxp-plan { position: relative; }
+        .result-overlay {
+            position: relative; z-index: 5; max-height: 260px;
+            padding: 9px 30px 9px 11px; border-radius: 3px; overflow-y: auto;
+            font-size: 14px; white-space: pre-wrap; line-height: 1.5;
+        }
+        .result-overlay-close {
+            position: absolute; top: 4px; right: 6px; width: auto; padding: 2px 7px;
+            background: transparent; color: inherit; border: none; font-size: 18px;
+            line-height: 1; cursor: pointer; opacity: 0.6;
+        }
+        .result-overlay-close:hover { opacity: 1; background: transparent; }
         .warning {
             color: #7a5500; background: #fff8e1; border: 1px solid #ffe082;
-            padding: 9px 11px; border-radius: 3px; font-size: 13px; line-height: 1.5;
+            padding: 9px 11px; border-radius: 3px; font-size: 14px; line-height: 1.5;
         }
-        .status-msg { color: #666; font-size: 13px; padding: 16px 0; text-align: center; }
-        .plan-summary { font-size: 13px; margin-bottom: 8px; line-height: 2; }
+        .status-msg { color: #666; font-size: 14px; padding: 16px 0; text-align: center; }
+        .plan-summary { font-size: 14px; margin-bottom: 8px; line-height: 2; }
         .plan-scroll { max-height: 380px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 3px; margin-bottom: 6px; }
         .plan-table { width: 100%; border-collapse: collapse; font-size: 12px; }
         .plan-table th { text-align: left; font-weight: 600; padding: 4px 5px; border-bottom: 1px solid #ddd; background: #f5f5f5; }
@@ -80,6 +112,7 @@
         .dep-label { font-size: 11px; font-weight: 500; color: #fff; border-radius: 3px; padding: 2px 6px; margin-left: 8px; white-space: nowrap; flex-shrink: 0; }
         .dep-label-page     { background: #5c6bc0; }
         .dep-label-block    { background: #3a7bd5; }
+        .dep-label-inlineblock { background: #1f4e9c; }
         .dep-label-image    { background: #e07820; }
         .dep-label-inline   { background: #c06010; }
         .dep-label-video    { background: #7b1fa2; }
@@ -90,6 +123,7 @@
         .row-status-pending  { color: #ccc; font-size: 20px; }
         .row-status-done     { color: #2e7d32; font-size: 20px; font-weight: 700; }
         .row-status-failed   { color: #c62828; font-size: 20px; font-weight: 700; }
+        .row-status-tracked  { color: #9e9e9e; font-size: 20px; font-weight: 700; }
         /* Expand/collapse toggle */
         .toggle-arrow {
             display: inline-block; width: 12px; margin-right: 3px;
@@ -110,6 +144,59 @@
         .transfer-banner {
             font-size: 12px; color: #555; background: #f5f8ff; border: 1px solid #cde;
             border-radius: 3px; padding: 5px 9px; margin-bottom: 8px; display: none;
+        }
+        /* One-line field rows: label + control side by side (shared by the language + environment pickers). */
+        .field-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .field-label { flex: 0 0 130px; margin: 0; font-size: 14px; font-weight: 500; color: #333; line-height: 1.3; }
+        /* Match the native select to the custom language toggle: strip the OS chrome, add the same caret. */
+        .field-row select {
+            flex: 1; width: auto; margin-bottom: 0;
+            appearance: none; -webkit-appearance: none; -moz-appearance: none;
+            padding: 6px 26px 6px 8px; font-weight: 400; color: #1a1a1a; cursor: pointer;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: right 9px center; background-size: 9px 6px;
+        }
+        .field-row select::-ms-expand { display: none; }
+        .destination-current { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; font-size: 14px; }
+        .destination-current strong { font-weight: 600; color: #1a1a1a; }
+        .destination-current a { font-size: 12px; color: #2973c3; text-decoration: none; white-space: nowrap; }
+        .destination-current a:hover { text-decoration: underline; }
+        /* Fixed (not max-) height so the box never grows/shrinks as nodes expand/collapse — keeps
+           everything below it (checkboxes, the transfer button) from shifting around. */
+        .destination-tree { height: 180px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 3px; padding: 0 0 4px; }
+        .dest-node-row { display: flex; align-items: center; gap: 4px; padding: 3px 6px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+        .dest-node-row:hover { background: #f5f7fa; }
+        .dest-node-selected { background: #e3edf9 !important; font-weight: 600; }
+        .dest-node-arrow { display: inline-block; width: 14px; text-align: center; color: #888; font-size: 10px; flex-shrink: 0; cursor: pointer; }
+        .dest-node-name { overflow: hidden; text-overflow: ellipsis; }
+        .dest-node-empty { color: #999; font-size: 12px; font-style: italic; padding: 3px 6px; }
+        .lang-multiselect { position: relative; flex: 1; }
+        .lang-toggle {
+            width: 100%; text-align: left; background: #fff; color: #1a1a1a; border: 1px solid #bbb;
+            border-radius: 3px; padding: 6px 8px; font-size: 14px; font-weight: 400; cursor: pointer;
+            display: flex; justify-content: space-between; align-items: center; gap: 6px;
+        }
+        .lang-toggle:hover { background: #fff; color: #1a1a1a; border-color: #888; }
+        .lang-toggle:focus { outline: none; border-color: #2973c3; box-shadow: 0 0 0 2px rgba(41,115,195,0.2); }
+        .lang-caret { color: #888; font-size: 10px; flex-shrink: 0; }
+        .lang-menu {
+            position: absolute; z-index: 20; top: calc(100% + 2px); left: 0; right: 0;
+            background: #fff; border: 1px solid #bbb; border-radius: 3px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15); max-height: 200px; overflow-y: auto; padding: 4px 0;
+        }
+        .lang-item {
+            display: flex; align-items: center; gap: 7px; padding: 5px 10px;
+            font-size: 14px; cursor: pointer; white-space: nowrap;
+        }
+        .lang-item:hover { background: #f0f6fc; }
+        .lang-item input { margin: 0; cursor: pointer; }
+        .lang-item .lang-name { text-transform: capitalize; }
+        .lang-item .lang-code { color: #999; }
+        .lang-item-master { cursor: default; }
+        .lang-item-master input:disabled { cursor: default; }
+        .lang-master-tag {
+            margin-left: auto; font-size: 11px; font-weight: 500; color: #2973c3;
+            background: #e8f0fb; border-radius: 8px; padding: 1px 7px;
         }
     </style>
 </head>
@@ -151,31 +238,80 @@ else
 {
     <!-- ── Form ──────────────────────────────────────────── -->
     <div id="dxp-form">
-        <h3>Transfer Content</h3>
-        <div class="page-name">@Model.ContentName</div>
+        <h3>Transferring Root Page <span class="root-name">@Model.ContentName</span></h3>
 
-        @if (Model.CurrentEnvironmentName != "Unknown")
-        {
-            <span class="env-badge">Current: @Model.CurrentEnvironmentName</span>
-        }
+        <div class="section-title">Transfer Options</div>
 
-        <label for="dxp-target">Transfer to</label>
-        <select id="dxp-target">
+        <div class="field-row">
+            <label class="field-label" for="dxp-target">Destination<br />Environment</label>
+            <select id="dxp-target" onchange="dxpTransfer.reloadDestinationTree()">
             @foreach (var env in Model.AvailableTargets)
             {
                 <option value="@env.Name">@env.Name</option>
             }
-        </select>
+            </select>
+        </div>
 
-        <div class="radio-group">
-            <div class="radio-row">
-                <input type="radio" name="dxp-status" id="dxp-status-draft" value="CheckedOut" />
-                <label for="dxp-status-draft">Transfer as draft</label>
+        <!-- ── Destination tree ("Place Under" picker) ──────────────────────
+             Ported from the nOCP SaaS content-transfer tool. Predicts an automatic location
+             (same ancestor-matching PreCheck itself uses) and lets the editor browse the target's
+             page tree to override it. The override applies only to the top-level item being
+             transferred — subpages keep their existing structure underneath it. -->
+        <div class="field-row" style="align-items:flex-start;">
+            <label class="field-label">Place Under</label>
+            <div style="flex:1;min-width:0;">
+                <div class="destination-current">
+                    <strong id="dxp-destination-label">&hellip;</strong>
+                    <a href="#" id="dxp-destination-auto-link" style="display:none"
+                       onclick="dxpTransfer.useAutomaticLocation();return false;">[Reset to Automatic Location]</a>
+                </div>
+                <div id="dxp-destination-tree" class="destination-tree">
+                    <div id="dxp-destination-tree-body" class="status-msg" style="padding:8px 0;">Loading&hellip;</div>
+                </div>
             </div>
-            <div class="radio-row">
-                <input type="radio" name="dxp-status" id="dxp-status-published" value="Published" checked />
-                <label for="dxp-status-published">Transfer as published</label>
+        </div>
+
+        @if (Model.AvailableLanguages != null && Model.AvailableLanguages.Count >= 2)
+        {
+            <div id="dxp-lang-row" class="field-row">
+                <label class="field-label">Languages</label>
+                <div class="lang-multiselect">
+                    <button type="button" class="lang-toggle" id="dxp-lang-toggle" onclick="dxpTransfer.toggleLangMenu()">
+                        <span id="dxp-lang-text">All Languages</span>
+                        <span class="lang-caret">&#9662;</span>
+                    </button>
+                    <div class="lang-menu" id="dxp-lang-menu" style="display:none">
+                        @foreach (var lang in Model.AvailableLanguages)
+                        {
+                            <label class="lang-item@(lang.IsMaster ? " lang-item-master" : "")"
+                                   title="@(lang.IsMaster ? "Master language — always transferred" : "")">
+                                @if (lang.IsMaster)
+                                {
+                                    <input type="checkbox" value="@lang.Code" checked="checked" disabled onchange="dxpTransfer.updateLangText()" />
+                                }
+                                else
+                                {
+                                    <input type="checkbox" value="@lang.Code" checked="checked" onchange="dxpTransfer.updateLangText()" />
+                                }
+                                <span class="lang-name">@lang.DisplayName</span>
+                                <span class="lang-code">[@lang.Code]</span>
+                                @if (lang.IsMaster)
+                                {
+                                    <span class="lang-master-tag">master</span>
+                                }
+                            </label>
+                        }
+                    </div>
+                </div>
             </div>
+        }
+
+        <div class="field-row">
+            <label class="field-label" for="dxp-state">Published<br /> State</label>
+            <select id="dxp-state">
+                <option value="Published" selected>Published</option>
+                <option value="CheckedOut">Draft</option>
+            </select>
         </div>
 
         <hr class="divider" />
@@ -183,14 +319,20 @@ else
         <div class="checkbox-row">
             <input type="checkbox" id="dxp-children" />
             <label for="dxp-children">Include Child Pages</label>
+            <span class="help" tabindex="0">?
+                <span class="help-bubble">When checked, all pages nested beneath this page will also be transferred. Leave unchecked to transfer only this page with related blocks and assets.</span>
+            </span>
         </div>
 
         <div class="checkbox-row">
             <input type="checkbox" id="dxp-overwrite" />
             <label for="dxp-overwrite">Overwrite Matched Pages</label>
+            <span class="help" tabindex="0">?
+                <span class="help-bubble">When checked, any page in the destination environment with a matching URL will be replaced. Leave unchecked to create a new version of the page with associated blocks and assets.</span>
+            </span>
         </div>
 
-        <button onclick="dxpTransfer.check()">Check Transfer Plan</button>
+        <button id="dxp-check-btn" onclick="dxpTransfer.check()">Check Transfer Plan</button>
     </div>
 
     <!-- ── Checking ──────────────────────────────────────── -->
@@ -203,6 +345,10 @@ else
     <div id="dxp-plan" style="display:none">
         <div class="transfer-banner" id="dxp-transfer-banner">Transferring&hellip;</div>
         <div id="dxp-plan-content"></div>
+        <div id="dxp-result-overlay" class="result-overlay" style="display:none">
+            <button type="button" class="result-overlay-close" onclick="dxpTransfer.dismissResult()" title="Close">&times;</button>
+            <div id="dxp-result-overlay-body"></div>
+        </div>
         <div class="btn-row" id="dxp-plan-btns">
             <button onclick="dxpTransfer.confirm()">Confirm &amp; Transfer</button>
             <button class="btn-cancel" onclick="dxpTransfer.cancel()">Cancel</button>
@@ -216,6 +362,7 @@ else
 <script>
 var dxpTransfer = (function () {
     var contentId = '@Html.Raw(Model.ContentId)';
+    var currentEnv = @Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.CurrentEnvironmentName));
     var plan = null;
     var pollTimer = null;
     var planRows = [];      // flat ordered list for polling: dep rows come before their page row
@@ -227,6 +374,16 @@ var dxpTransfer = (function () {
     var savedPlanCounts = null;
     var transferInProgress = false;
 
+    // ── Destination tree ("Place Under" picker) state ────────
+    var destinationRootKey = null;
+    var destinationDefaultKey = null;
+    var destinationDefaultName = null;
+    var destinationOverrideKey = null;
+    var destinationOverrideName = null;
+    var destinationLocale = null; // site default locale, resolved once per load — keeps every tree name in the same language
+    var destinationNodes = {}; // key -> { name, children: [{key,name}]|null, expanded }
+    var destinationLoadSeq = 0; // guards against a stale response landing after a newer target-env change
+
     window.addEventListener('beforeunload', function (e) {
         if (transferInProgress) {
             e.preventDefault();
@@ -234,11 +391,26 @@ var dxpTransfer = (function () {
         }
     });
 
-    document.getElementById('dxp-target')?.addEventListener('change', resetResult);
+    document.getElementById('dxp-target')?.addEventListener('change', function () {
+        resetResult();
+        updateCheckBtn();
+    });
 
     function getStatus() {
-        var el = document.querySelector('input[name="dxp-status"]:checked');
+        var el = document.getElementById('dxp-state');
         return el ? el.value : 'Published';
+    }
+
+    // Reflect the selected environments in the check button: "Transfer from {current} to {target}".
+    function updateCheckBtn() {
+        var btn = document.getElementById('dxp-check-btn');
+        if (!btn) return;
+        var target = document.getElementById('dxp-target');
+        var targetName = target ? target.value : '';
+        if (!targetName) { btn.textContent = 'Check Transfer Plan'; return; }
+        btn.textContent = (currentEnv && currentEnv !== 'Unknown')
+            ? 'Transfer from ' + currentEnv + ' to ' + targetName
+            : 'Transfer to ' + targetName;
     }
 
     function check() {
@@ -265,7 +437,7 @@ var dxpTransfer = (function () {
             (deps || []).forEach(function (d) {
                 switch (d.nodeType) {
                     case 'Image': case 'InlineImage': counts.images++; break;
-                    case 'Block': counts.blocks++;    break;
+                    case 'Block': case 'InlineBlock': counts.blocks++; break;
                     case 'Page':  counts.pageRefs++;  break;
                     default:      counts.other++;     break; // Video, Audio, Document, UnknownMedia
                 }
@@ -362,8 +534,200 @@ var dxpTransfer = (function () {
             targetEnvironment: document.getElementById('dxp-target').value,
             includeChildren: document.getElementById('dxp-children').checked,
             overwriteMatchingIds: document.getElementById('dxp-overwrite').checked,
-            transferStatus: getStatus()
+            transferStatus: getStatus(),
+            selectedLanguages: getSelectedLanguages(),
+            destinationParentId: destinationOverrideKey || null,
+            destinationParentName: destinationOverrideKey ? destinationOverrideName : null
         };
+    }
+
+    // ── Destination tree ("Place Under" picker) ──────────────
+    // Ported from the nOCP SaaS content-transfer tool's target-directory picker. Root of the
+    // browsable tree is the same site-root guid PreCheck's own automatic fallback uses (see
+    // ContentTransferService.GetDestinationTreeRootAsync) — no separate "root container" setting to
+    // configure.
+    //
+    // PERF: originally lazy — one fetch per expand click (a ListItemsAsync plus a ListVersionsAsync
+    // per child just for its name) — which felt slow even on a small site. The backend now preloads
+    // the whole tree in a single request (GetDestinationTreeRootAsync, capped server-side), so
+    // everything below is a pure local state toggle with zero further network calls.
+
+    function currentTargetEnv() {
+        var el = document.getElementById('dxp-target');
+        return el ? el.value : '';
+    }
+
+    // Flattens the nested tree the server sends into the same key->node map the renderer already
+    // used when nodes were fetched one level at a time.
+    function flattenDestinationTree(node) {
+        if (!node || !node.key) return;
+        destinationNodes[node.key] = {
+            name: node.name,
+            children: (node.children || []).map(function (c) { return { key: c.key, name: c.name }; }),
+            expanded: false
+        };
+        (node.children || []).forEach(flattenDestinationTree);
+    }
+
+    // Called on initial load and whenever the target-environment selection changes — the automatic
+    // prediction and the whole tree are environment-specific.
+    function reloadDestinationTree() {
+        var seq = ++destinationLoadSeq;
+        destinationOverrideKey = null;
+        destinationOverrideName = null;
+        destinationRootKey = null;
+        destinationDefaultKey = null;
+        destinationDefaultName = null;
+        destinationLocale = null;
+        destinationNodes = {};
+        updateDestinationLabel();
+
+        var body = document.getElementById('dxp-destination-tree-body');
+        if (body) body.innerHTML = '<div class="status-msg" style="padding:8px 0;">Loading&hellip;</div>';
+
+        fetch('/dxp-content-transfer/api/destination-tree/root?contentId=' + encodeURIComponent(contentId)
+                + '&targetEnvironment=' + encodeURIComponent(currentTargetEnv()))
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (seq !== destinationLoadSeq) return; // a newer environment change superseded this
+                if (!data || !data.success) {
+                    if (body) body.innerHTML = '<div class="plan-notes">' + esc((data && data.errorMessage) || 'Could not load destination tree.') + '</div>';
+                    return;
+                }
+                destinationRootKey = data.rootKey;
+                destinationDefaultKey = data.defaultParentKey;
+                destinationDefaultName = data.defaultParentName;
+                destinationLocale = data.defaultLocale || null;
+                flattenDestinationTree(data.tree || { key: data.rootKey, name: data.rootName, children: [] });
+                // Auto-expand every ancestor of the predicted location — already loaded, so this is
+                // instant, no fetching involved.
+                (data.expandPath || []).forEach(function (key) {
+                    if (destinationNodes[key]) destinationNodes[key].expanded = true;
+                });
+                updateDestinationLabel();
+                renderDestinationTree();
+                if (data.truncated) {
+                    var note = document.createElement('div');
+                    note.className = 'plan-notes';
+                    note.style.padding = '4px 6px';
+                    note.textContent = 'Large site — showing a partial tree. Automatic placement still works normally.';
+                    document.getElementById('dxp-destination-tree-body').appendChild(note);
+                }
+            })
+            .catch(function () {
+                if (seq !== destinationLoadSeq) return;
+                if (body) body.innerHTML = '<div class="plan-notes">Could not load destination tree.</div>';
+            });
+    }
+
+    function toggleDestinationNode(key) {
+        var node = destinationNodes[key];
+        if (!node) return;
+        node.expanded = !node.expanded;
+        renderDestinationTree();
+    }
+
+    function selectDestinationNode(key) {
+        var node = destinationNodes[key];
+        if (!node) return;
+        destinationOverrideKey = key;
+        destinationOverrideName = node.name;
+        updateDestinationLabel();
+        renderDestinationTree();
+    }
+
+    function useAutomaticLocation() {
+        destinationOverrideKey = null;
+        destinationOverrideName = null;
+        updateDestinationLabel();
+        renderDestinationTree();
+    }
+
+    function updateDestinationLabel() {
+        var label = document.getElementById('dxp-destination-label');
+        var link = document.getElementById('dxp-destination-auto-link');
+        if (!label) return;
+        label.textContent = destinationOverrideKey ? destinationOverrideName : (destinationDefaultName || '…');
+        if (link) link.style.display = destinationOverrideKey ? '' : 'none';
+    }
+
+    function renderDestinationTree() {
+        var body = document.getElementById('dxp-destination-tree-body');
+        if (!body || !destinationRootKey) return;
+        body.innerHTML = '';
+        body.appendChild(renderDestinationNode(destinationRootKey, 0));
+    }
+
+    function renderDestinationNode(key, depth) {
+        var node = destinationNodes[key];
+        var container = document.createDocumentFragment();
+        if (!node) return container;
+
+        var selectedKey = destinationOverrideKey || destinationDefaultKey;
+        var row = document.createElement('div');
+        row.className = 'dest-node-row' + (key === selectedKey ? ' dest-node-selected' : '');
+        row.style.paddingLeft = (depth * 16) + 'px';
+        row.title = node.name;
+
+        var hasChildren = !!(node.children && node.children.length);
+        var arrow = document.createElement('span');
+        arrow.className = 'dest-node-arrow';
+        if (hasChildren) {
+            arrow.innerHTML = node.expanded ? '&#9660;' : '&#9654;';
+            arrow.addEventListener('click', function (e) { e.stopPropagation(); toggleDestinationNode(key); });
+        }
+        // No children (known up front — the whole tree is preloaded): leave the arrow blank rather
+        // than showing an expander that would just reveal "(no pages)".
+        row.appendChild(arrow);
+
+        var label = document.createElement('span');
+        label.className = 'dest-node-name';
+        label.textContent = node.name;
+        row.appendChild(label);
+
+        row.addEventListener('click', function () { selectDestinationNode(key); });
+
+        var wrap = document.createElement('div');
+        wrap.appendChild(row);
+        container.appendChild(wrap);
+
+        if (node.expanded) {
+            if (node.children && node.children.length) {
+                node.children.forEach(function (c) { wrap.appendChild(renderDestinationNode(c.key, depth + 1)); });
+            } else if (node.children) {
+                var empty = document.createElement('div');
+                empty.className = 'dest-node-empty';
+                empty.style.paddingLeft = ((depth + 1) * 16) + 'px';
+                empty.textContent = '(no pages)';
+                wrap.appendChild(empty);
+            }
+        }
+        return container;
+    }
+
+    // ── Language picker ─────────────────────────────────────
+    // The picker is server-rendered on the form (only when the content has 2+ languages); no boxes
+    // ticked = "transfer all languages". These helpers no-op gracefully when the picker is absent.
+
+    // The selection sent to the backend is the ticked NON-master languages. The master is excluded
+    // here because it always transfers regardless; an empty list therefore means "master only".
+    function getSelectedLanguages() {
+        return Array.prototype.slice
+            .call(document.querySelectorAll('#dxp-lang-menu input:checked:not(:disabled)'))
+            .map(function (cb) { return cb.value; });
+    }
+
+    // Toggle text counts every ticked box (master included, since it's always on): all ticked reads
+    // "All Languages"; a subset reads "N Languages selected".
+    function updateLangText() {
+        var text = document.getElementById('dxp-lang-text');
+        if (!text) return;
+        var all = document.querySelectorAll('#dxp-lang-menu input');
+        if (all.length === 0) return;
+        var checked = document.querySelectorAll('#dxp-lang-menu input:checked').length;
+        text.textContent = (checked === all.length)
+            ? 'All Languages'
+            : checked + ' Language' + (checked === 1 ? '' : 's') + ' selected';
     }
 
     // ── Row-level progress polling ──────────────────────────
@@ -510,8 +874,10 @@ var dxpTransfer = (function () {
             var meta = { pageRow: tr, depRows: depRows, expanded: false };
             planItemMeta.push(meta);
 
-            // Deps pushed before page row so the page ticks ✓ only after all deps tick ✓
-            depRows.forEach(function(r) { planRows.push(r); });
+            // Deps pushed before page row so the page ticks ✓ only after all deps tick ✓. Page-ref
+            // rows are excluded here (see renderDepRows) — they never generate a completion event,
+            // so including them in the polling index would desync every row that follows them.
+            depRows.forEach(function(r) { if (r.dataset.pageRef !== '1') planRows.push(r); });
             planRows.push(tr);
         });
 
@@ -537,6 +903,7 @@ var dxpTransfer = (function () {
             case 'Page':         return { text: 'page ref', cls: 'dep-label dep-label-page' };
             case 'Image':        return { text: 'image',    cls: 'dep-label dep-label-image' };
             case 'InlineImage':  return { text: 'inline',   cls: 'dep-label dep-label-inline' };
+            case 'InlineBlock':  return { text: 'inline block', cls: 'dep-label dep-label-inlineblock' };
             case 'Video':        return { text: 'video',    cls: 'dep-label dep-label-video' };
             case 'Audio':        return { text: 'audio',    cls: 'dep-label dep-label-audio' };
             case 'Document':     return { text: 'document', cls: 'dep-label dep-label-document' };
@@ -554,13 +921,25 @@ var dxpTransfer = (function () {
             var tr = document.createElement('tr');
             tr.className = 'dep-row';
             if (node.contentGuid) tr.dataset.guid = node.contentGuid.toLowerCase();
+            // BUG FIX: a "Page" dependency is tracked/displayed only — ProcessReferencedDependenciesAsync
+            // explicitly skips transferring page references (see ContentTransferService.cs), so it never
+            // fires onItemComplete for one. Counting these rows in the polling index (see planRows below)
+            // meant the completed-count-to-row mapping drifted for everything after the first page ref,
+            // which is why rows visibly stalled partway through and then all flipped at once at the end.
+            // Give it a neutral "tracked, not transferred" mark up front instead of a pending spinner that
+            // polling will never actually resolve.
+            var isPageRef = node.nodeType === 'Page';
+            if (isPageRef) tr.dataset.pageRef = '1';
+            var statusCell = isPageRef
+                ? '<span class="row-status-tracked" title="Referenced only — pages are not copied by this transfer">&#8211;</span>'
+                : '<span class="row-status-pending">○</span>';
             tr.innerHTML = '<td colspan="3">'
                 + '<div class="dep-cell">'
                 + '<span class="dep-name">' + indent + '&#x21B3; ' + esc(node.name || '') + '</span>'
                 + '<span class="' + label.cls + '">' + label.text + '</span>'
                 + '</div>'
                 + '</td>'
-                + '<td class="col-status"><span class="row-status-pending">○</span></td>';
+                + '<td class="col-status">' + statusCell + '</td>';
             tbody.appendChild(tr);
             out.push(tr);
 
@@ -575,11 +954,17 @@ var dxpTransfer = (function () {
         if (state === 'form' || state === 'done') transferInProgress = false;
         document.getElementById('dxp-form').style.display     = state === 'form'     ? '' : 'none';
         document.getElementById('dxp-checking').style.display = state === 'checking' ? '' : 'none';
-        document.getElementById('dxp-plan').style.display     = (state === 'plan' || state === 'transferring') ? '' : 'none';
+        // DEBUG CHANGE (temporary, at user's request): keep the plan/progress table visible in the
+        // 'done' state instead of hiding it, so every row's final ✓/✗ (set by applyRowResults right
+        // before this fires) stays on screen for inspection instead of being swapped out for just
+        // the summary — the previous behavior made it impossible to tell, after the fact, which
+        // individual items/dependencies actually succeeded vs. failed.
+        document.getElementById('dxp-plan').style.display     = (state === 'plan' || state === 'transferring' || state === 'done') ? '' : 'none';
         document.getElementById('dxp-done-btn').style.display = state === 'done'     ? '' : 'none';
         if (state !== 'plan' && state !== 'transferring') {
             document.getElementById('dxp-transfer-banner').style.display = 'none';
             var btns = document.getElementById('dxp-plan-btns');
+            btns.style.display = state === 'done' ? 'none' : '';
             btns.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
         }
     }
@@ -591,9 +976,9 @@ var dxpTransfer = (function () {
     }
 
     function showResultWithLinks(data, targetEnv, failed) {
-        var el = document.getElementById('dxp-result');
+        var wrap = document.getElementById('dxp-result-overlay');
+        var body = document.getElementById('dxp-result-overlay-body');
         var hasFailures = failed && failed.length > 0;
-        var linked = (data.items || []).filter(function (i) { return i.success && i.targetContentId && i.targetBaseUrl; });
         var html = '<strong>Transferred ' + data.transferredCount + ' item(s) to ' + esc(targetEnv)
             + (hasFailures ? ' with ' + failed.length + ' failure(s).' : ' successfully.') + '</strong>';
 
@@ -613,17 +998,6 @@ var dxpTransfer = (function () {
             if (savedPlanCounts.other)    parts.push(savedPlanCounts.other    + ' other file' + (savedPlanCounts.other  !== 1 ? 's' : ''));
             if (parts.length)
                 html += '<div style="margin-top:3px;font-size:12px;color:#555;">Included: ' + parts.join(', ') + '</div>';
-        }
-        if (savedPlanItems && savedPlanItems.length) {
-            var roots = buildResultTree(savedPlanItems, data.items || []);
-            html += renderResultTreeHtml(roots, 0);
-        } else if (linked.length) {
-            html += '<ul style="margin:8px 0 0;padding-left:18px;">';
-            linked.forEach(function (i) {
-                var url = i.targetBaseUrl.replace(/\/$/, '') + '/EPiServer/CMS/#context=epi.cms.contentdata:///' + i.targetContentId;
-                html += '<li><a href="' + esc(url) + '" target="_blank">' + esc(i.contentName || i.contentId) + '</a></li>';
-            });
-            html += '</ul>';
         }
         // Defaults warning
         var defaulted = (data.items || []).filter(function(i) { return i.defaultedProperties && i.defaultedProperties.length; });
@@ -646,50 +1020,13 @@ var dxpTransfer = (function () {
         html += '<div style="margin-top:10px;">'
             + '<a href="#" onclick="dxpTransfer.downloadLog();return false;" style="font-size:12px;color:#2973c3;">&#11123; Download transfer log</a>'
             + '</div>';
-        el.className = hasFailures ? 'result partial' : 'result success';
-        el.innerHTML = html;
-        el.style.display = 'block';
-    }
-
-    function buildResultTree(planItems, resultItems) {
-        var resultById = {};
-        resultItems.forEach(function(r) { resultById[r.contentId] = r; });
-        // Map each item's effective target GUID → its index so children can find their parent
-        var guidToIdx = {};
-        planItems.forEach(function(p, i) {
-            var g = (p.action === 1 && p.newGuid) ? p.newGuid : p.contentGuid;
-            if (g) guidToIdx[g.toLowerCase()] = i;
-        });
-        var nodes = planItems.map(function(p) {
-            return { plan: p, result: resultById[p.contentId] || null, children: [] };
-        });
-        var roots = [];
-        nodes.forEach(function(node) {
-            var pg = node.plan.targetParentGuid;
-            var parentIdx = pg ? guidToIdx[pg.toLowerCase()] : undefined;
-            if (parentIdx !== undefined) nodes[parentIdx].children.push(node);
-            else roots.push(node);
-        });
-        return roots;
-    }
-
-    function renderResultTreeHtml(nodes, depth) {
-        if (!nodes.length) return '';
-        var html = '<ul style="margin:' + (depth === 0 ? '8px' : '3px') + ' 0 0;padding-left:18px;">';
-        nodes.forEach(function(node) {
-            var r = node.result;
-            html += '<li>';
-            if (r && r.success && r.targetContentId && r.targetBaseUrl) {
-                var url = r.targetBaseUrl.replace(/\/$/, '') + '/EPiServer/CMS/#context=epi.cms.contentdata:///' + r.targetContentId;
-                html += '<a href="' + esc(url) + '" target="_blank" style="color:#000;">' + esc(r.contentName || node.plan.contentName || node.plan.contentId) + '</a>';
-            } else {
-                var colour = (r && !r.success) ? '#c62828' : '#888';
-                html += '<span style="color:' + colour + '">' + esc(node.plan.contentName || node.plan.contentId) + '</span>';
-            }
-            if (node.children.length) html += renderResultTreeHtml(node.children, depth + 1);
-            html += '</li>';
-        });
-        return html + '</ul>';
+        wrap.className = 'result-overlay ' + (hasFailures ? 'partial' : 'success');
+        body.innerHTML = html;
+        wrap.style.display = 'block';
+        // Hide the table rather than stack the summary on top of it — keeps the box sized to its
+        // own content. dismissResult() brings the table back exactly as it was (still in the DOM).
+        var planContent = document.getElementById('dxp-plan-content');
+        if (planContent) planContent.style.display = 'none';
     }
 
     function downloadLog() {
@@ -707,6 +1044,7 @@ var dxpTransfer = (function () {
                 case 'Document':     return 'Document';
                 case 'UnknownMedia': return 'Media';
                 case 'Block':        return 'Block';
+                case 'InlineBlock':  return 'Inline Block';
                 default:             return nodeType || 'Asset';
             }
         }
@@ -761,13 +1099,43 @@ var dxpTransfer = (function () {
 
     function resetResult() {
         document.getElementById('dxp-result').style.display = 'none';
+        document.getElementById('dxp-result-overlay').style.display = 'none';
+        var planContent = document.getElementById('dxp-plan-content');
+        if (planContent) planContent.style.display = '';
+    }
+
+    function dismissResult() {
+        document.getElementById('dxp-result-overlay').style.display = 'none';
+        var planContent = document.getElementById('dxp-plan-content');
+        if (planContent) planContent.style.display = '';
     }
 
     function esc(str) {
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    return { check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog };
+
+    function toggleLangMenu() {
+        var menu = document.getElementById('dxp-lang-menu');
+        menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+    }
+
+    // Close the language menu when clicking anywhere outside it.
+    document.addEventListener('click', function (e) {
+        var ms = document.querySelector('.lang-multiselect');
+        var menu = document.getElementById('dxp-lang-menu');
+        if (menu && ms && !ms.contains(e.target)) menu.style.display = 'none';
+    });
+
+    updateCheckBtn();
+    updateLangText();
+    reloadDestinationTree();
+
+    return {
+        check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog,
+        toggleLangMenu: toggleLangMenu, updateLangText: updateLangText, dismissResult: dismissResult,
+        reloadDestinationTree: reloadDestinationTree, useAutomaticLocation: useAutomaticLocation
+    };
 })();
 </script>
 </body>

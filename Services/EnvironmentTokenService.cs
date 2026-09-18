@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using DxpContentTransfer.Cms13.Models;
 using Microsoft.Extensions.Caching.Memory;
@@ -20,7 +22,8 @@ public class EnvironmentTokenService : IEnvironmentTokenService
 
     public async Task<string> GetTokenAsync(DxpEnvironmentConfig config)
     {
-        var cacheKey = $"dxp_token_{config.BaseUrl}";
+        // Key on BaseUrl + ClientKey so rotating the client credentials doesn't serve a stale token.
+        var cacheKey = $"dxp_token_{config.BaseUrl}_{config.ClientKey}";
 
         if (_cache.TryGetValue(cacheKey, out string cachedToken))
         {
@@ -29,20 +32,30 @@ public class EnvironmentTokenService : IEnvironmentTokenService
         }
 
         var client = _httpClientFactory.CreateClient();
-        var tokenUrl = $"{config.BaseUrl.TrimEnd('/')}/api/episerver/connect/token";
+        // New CMS 13 REST API's own OAuth endpoint — NOT the old EPiServer OpenIDConnect
+        // /api/episerver/connect/token. The two auth systems are entirely separate and do not
+        // interoperate (confirmed live: a token from one is flatly 401'd by the other's API).
+        var tokenUrl = $"{config.BaseUrl.TrimEnd('/')}/_cms/v1/oauth/token";
 
-        var formBody = $"grant_type=client_credentials&client_id={Uri.EscapeDataString(config.ClientKey)}&client_secret=[redacted]&scope=epi_content_management";
-        _logger.LogDebug(">>> POST {TokenUrl}\n    Purpose: Acquiring OAuth2 client_credentials token for {Env}\n    Content-Type: application/x-www-form-urlencoded\n{FormBody}", tokenUrl, config.Name, formBody);
-
+        // Confirmed live: this endpoint wants the client credentials as HTTP Basic auth, NOT as
+        // client_id/client_secret form fields (the old OpenIDConnect convention) — sending them
+        // as form fields gets "The authorization field is required." Scope is `api:admin`
+        // ("full administrative access to the API" per Optimizely's docs); there is no narrower
+        // documented scope for content read/write specifically.
         var form = new Dictionary<string, string>
         {
             ["grant_type"] = "client_credentials",
-            ["client_id"] = config.ClientKey,
-            ["client_secret"] = config.ClientSecret,
-            ["scope"] = "epi_content_management"
+            ["scope"] = "api:admin"
         };
 
-        var response = await client.PostAsync(tokenUrl, new FormUrlEncodedContent(form));
+        using var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl) { Content = new FormUrlEncodedContent(form) };
+        var basicAuth = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{config.ClientKey}:{config.ClientSecret}"));
+        request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basicAuth);
+
+        _logger.LogDebug(">>> POST {TokenUrl}\n    Purpose: Acquiring OAuth2 client_credentials token for {Env}\n    Authorization: Basic [redacted] (client_id={ClientId})\n    Content-Type: application/x-www-form-urlencoded\n    grant_type=client_credentials&scope=api:admin",
+            tokenUrl, config.Name, config.ClientKey);
+
+        var response = await client.SendAsync(request);
         var json = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
@@ -55,33 +68,13 @@ public class EnvironmentTokenService : IEnvironmentTokenService
         var root = doc.RootElement;
 
         var token = root.GetProperty("access_token").GetString();
-        var expiresIn = root.TryGetProperty("expires_in", out var expProp) ? expProp.GetInt32() : 3600;
-        var grantedScope = root.TryGetProperty("scope", out var scopeProp) ? scopeProp.GetString() : "(not returned)";
-        _logger.LogDebug("Token acquired for {Env}: expires_in={ExpiresIn}s scope='{Scope}'",
-            config.Name, expiresIn, grantedScope);
+        var expiresIn = root.TryGetProperty("expires_in", out var expProp) ? expProp.GetInt32() : 300;
+        _logger.LogDebug("Token acquired for {Env}: expires_in={ExpiresIn}s", config.Name, expiresIn);
 
-        _ = LogUserInfoAsync(client, config, token);
-
-        _cache.Set(cacheKey, token, TimeSpan.FromSeconds(expiresIn - 30));
+        // The new API's tokens are short-lived (confirmed live: 300s / 5 minutes, vs. the old
+        // OpenIDConnect token's 3600s) — cache with a tighter safety margin accordingly.
+        _cache.Set(cacheKey, token, TimeSpan.FromSeconds(Math.Max(expiresIn - 15, 15)));
 
         return token;
-    }
-
-    private async Task LogUserInfoAsync(HttpClient client, DxpEnvironmentConfig config, string token)
-    {
-        try
-        {
-            var userinfoUrl = $"{config.BaseUrl.TrimEnd('/')}/api/episerver/connect/userinfo";
-            _logger.LogDebug(">>> GET {UserinfoUrl}\n    Purpose: Resolving identity for {Env} via userinfo endpoint", userinfoUrl, config.Name);
-            var req = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, userinfoUrl);
-            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
-            var resp = await client.SendAsync(req);
-            var body = await resp.Content.ReadAsStringAsync();
-            _logger.LogDebug("<<< {Status} GET {UserinfoUrl}\n{Body}", (int)resp.StatusCode, userinfoUrl, body);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug("Userinfo call failed for {Env}: {Error}", config.Name, ex.Message);
-        }
     }
 }

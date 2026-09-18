@@ -11,7 +11,7 @@ public class DxpTransferMenuProvider : IMenuProvider
         {
             new UrlMenuItem(
                 "DXP Content Transfer",
-                "/global/cms/admin/tools/dxp.transfer.cms13",
+                MenuPaths.Global + "/cms/admin/tools/dxp.transfer",
                 "/EPiServer/DxpContentTransfer/Admin/Settings")
             {
                 IsAvailable = _ => true,

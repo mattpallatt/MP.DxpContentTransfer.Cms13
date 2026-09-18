@@ -17,7 +17,7 @@ public class PreCheckItemResult
 public class DependencyNode
 {
     public string Name { get; set; }
-    public string NodeType { get; set; } // "Block" | "Image" | "InlineImage"
+    public string NodeType { get; set; } // "Block" | "Image" | "InlineImage" | "InlineBlock"
     public string ContentGuid { get; set; }
     public List<DependencyNode> Children { get; set; } = new();
 }

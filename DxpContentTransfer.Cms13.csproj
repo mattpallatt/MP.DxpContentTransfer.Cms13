@@ -5,9 +5,9 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>MP.DxpContentTransfer.Cms13</PackageId>
-    <Version>0.2.0</Version>
+    <Version>1.0.0</Version>
     <Authors>Matt Pallatt</Authors>
-    <Description>An Optimizely CMS 13 gadget that lets editors push content between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar — no developer involvement required. (BETA - probably not ideal to be using on Production systems quite yet - except at your own risk).</Description>
+    <Description>An Optimizely CMS 13 gadget that lets content editors push content (pages, blocks, images, etc.) between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar with no developer involvement required.</Description>
     <ProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</ProjectUrl>
     <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -16,5 +16,6 @@
   <ItemGroup>
     <PackageReference Include="EPiServer.CMS.Core" Version="[13.0.0, 14.0.0)" />
     <PackageReference Include="EPiServer.CMS.UI.Core" Version="[13.0.0, 14.0.0)" />
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
   </ItemGroup>
 </Project>

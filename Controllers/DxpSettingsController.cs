@@ -9,10 +9,12 @@ namespace DxpContentTransfer.Cms13.Controllers;
 public class DxpSettingsController : Controller
 {
     private readonly IDxpSettingsService _settingsService;
+    private readonly IEnvironmentHealthService _healthService;
 
-    public DxpSettingsController(IDxpSettingsService settingsService)
+    public DxpSettingsController(IDxpSettingsService settingsService, IEnvironmentHealthService healthService)
     {
         _settingsService = settingsService;
+        _healthService = healthService;
     }
 
     [HttpGet]
@@ -22,6 +24,9 @@ public class DxpSettingsController : Controller
         Response.Headers["X-Frame-Options"] = "SAMEORIGIN";
         var settings = _settingsService.Get();
         var model = MapToViewModel(settings);
+        // CMS 13: shell-aware view that includes the navigation bundle so the sidebar remains visible.
+        // CMS 12: standalone HTML displayed inside the AdminInit.js iframe overlay — no platform nav
+        //         markup so the admin chrome doesn't render twice inside the iframe.
         return View("~/Views/DxpSettings/Index.cshtml", model);
     }
 
@@ -58,6 +63,24 @@ public class DxpSettingsController : Controller
         return View("~/Views/DxpSettings/Index.cshtml", model);
     }
 
+    // Diagnostic probe for the "Test connection" button. Tests the credentials currently in the
+    // form (not the saved ones), so editors can verify before saving. Returns JSON for the page's AJAX.
+    [HttpPost]
+    [Route("~/EPiServer/DxpContentTransfer/Admin/TestConnection")]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> TestConnection(string environment, string baseUrl, string clientKey, string clientSecret)
+    {
+        var config = new DxpEnvironmentConfig
+        {
+            Name = environment,
+            BaseUrl = baseUrl?.Trim(),
+            ClientKey = clientKey?.Trim(),
+            ClientSecret = clientSecret?.Trim()
+        };
+        var result = await _healthService.CheckAsync(config);
+        return Json(new { ok = result.Ok, message = result.Message });
+    }
+
     private static SettingsViewModel MapToViewModel(DxpTransferSettings settings) => new()
     {
         IntegrationBaseUrl = settings.Integration?.BaseUrl,
@@ -72,4 +95,5 @@ public class DxpSettingsController : Controller
         ProductionClientKey = settings.Production?.ClientKey,
         ProductionClientSecret = settings.Production?.ClientSecret
     };
+
 }
