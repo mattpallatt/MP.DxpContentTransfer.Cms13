@@ -798,13 +798,26 @@ var dxpTransfer = (function () {
         if (cell) { cell.textContent = '✗'; cell.className = 'row-status-failed'; }
     }
 
+    // BUG FIX: failedDependencyGuids mixes two incompatible shapes from ContentTransferService --
+    // a clean dashed GUID ("xxxxxxxx-xxxx-...") for a dependency that failed to transfer outright,
+    // vs. a dash-FREE 32-char key plus trailing detail text ("{key}:{field} (property omitted --
+    // target rejected it: {...})") for a property that got stripped-and-retried. Exact-matching
+    // against row.dataset.guid (always dashed, from node.contentGuid) only ever caught the first
+    // shape -- confirmed live: a stripped Venue reference left its row incorrectly ticked ✓ instead
+    // of ✗, because "09aef654...(details)" never equals "09aef654-8a14-...". Normalize both sides
+    // to a dash-free lowercase GUID PREFIX before comparing so either shape matches.
+    function normalizeGuidPrefix(value) {
+        var head = (value || '').split(':')[0].split(' ')[0];
+        return head.replace(/-/g, '').toLowerCase();
+    }
+
     function applyRowResults(result) {
         var successMap = {};
         var failedGuidSet = {};
         (result.items || []).forEach(function (item) {
             if (item.contentId) successMap[item.contentId] = item.success;
             (item.failedDependencyGuids || []).forEach(function (g) {
-                failedGuidSet[g.toLowerCase()] = true;
+                failedGuidSet[normalizeGuidPrefix(g)] = true;
             });
         });
         planRows.forEach(function (row) {
@@ -813,7 +826,7 @@ var dxpTransfer = (function () {
             if (cid && cid in successMap) {
                 if (successMap[cid]) setRowDone(row);
                 else setRowFailed(row);
-            } else if (guid && failedGuidSet[guid]) {
+            } else if (guid && failedGuidSet[normalizeGuidPrefix(guid)]) {
                 setRowFailed(row);
             } else {
                 setRowDone(row);
