@@ -1095,7 +1095,17 @@ public class ContentTransferService : IContentTransferService
             var refKey = ToKey(refGuid);
             var sourceToken = await _tokenService.GetTokenAsync(source);
             var refNodeResp = await _api.GetNodeAsync(source.BaseUrl, sourceToken, refKey, "read referenced source node");
-            if (!refNodeResp.IsSuccess) { visited.Remove(refGuid); continue; }
+            if (!refNodeResp.IsSuccess)
+            {
+                // Previously silent — a required reference that couldn't even be READ from source
+                // (as opposed to failing to WRITE on target, already logged at the TransferItemCoreAsync
+                // catch below) left no trace at all of why it never got attempted, only the eventual
+                // "Property 'X' is required" from the referencing item's own stripped write.
+                _logger.LogWarning("Could not read referenced dependency {Guid} from source: HTTP {Status}", refGuid, (int)refNodeResp.Status);
+                failedDependencyGuids?.Add($"{refKey} (could not read from source: HTTP {(int)refNodeResp.Status})");
+                visited.Remove(refGuid);
+                continue;
+            }
 
             var refContentType = ExtractStringField(refNodeResp.Body, "contentType");
             if (IsPageContentType(refContentType)) continue; // tracked, not transferred
@@ -1315,15 +1325,21 @@ public class ContentTransferService : IContentTransferService
                 {
                     if (badIndex.HasValue && badPropObj["value"] is JsonArray badArray && badIndex.Value >= 0 && badIndex.Value < badArray.Count)
                     {
-                        _logger.LogDebug("Stripping array item [{Index}] from '{Prop}' on {Key} and retrying ({Attempt}/{Max})", badIndex.Value, badField, key, attempt + 1, MaxWriteAttempts);
+                        // LogWarning, not LogDebug, and includes the target's actual rejection body:
+                        // this is the ONLY place the real reason a property got stripped is ever
+                        // recorded. Confirmed live: a required ContentReference (Venue) stripped here
+                        // for a genuinely broken dependency surfaced downstream only as "Property
+                        // 'Venue' is required" — the FINAL retry's error, not the original rejection
+                        // reason — because nothing logged resp.Body at the point of stripping.
+                        _logger.LogWarning("Stripping array item [{Index}] from '{Prop}' on {Key} and retrying ({Attempt}/{Max}) — target rejected it: {Body}", badIndex.Value, badField, key, attempt + 1, MaxWriteAttempts, resp.Body);
                         badArray.RemoveAt(badIndex.Value);
-                        failedDependencyGuids?.Add($"{key}:{badField}[{badIndex.Value}] (array item omitted — target rejected it)");
+                        failedDependencyGuids?.Add($"{key}:{badField}[{badIndex.Value}] (array item omitted — target rejected it: {resp.Body})");
                         continue;
                     }
 
-                    _logger.LogDebug("Stripping property '{Prop}' from {Key} and retrying ({Attempt}/{Max})", badField, key, attempt + 1, MaxWriteAttempts);
+                    _logger.LogWarning("Stripping property '{Prop}' from {Key} and retrying ({Attempt}/{Max}) — target rejected it: {Body}", badField, key, attempt + 1, MaxWriteAttempts, resp.Body);
                     propertiesNode.Remove(badField);
-                    failedDependencyGuids?.Add($"{key}:{badField} (property omitted — target rejected it)");
+                    failedDependencyGuids?.Add($"{key}:{badField} (property omitted — target rejected it: {resp.Body})");
                     continue;
                 }
             }
