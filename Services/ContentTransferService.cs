@@ -1175,26 +1175,42 @@ public class ContentTransferService : IContentTransferService
         if (versions.Count > 0)
         {
             var v = versions[0];
-            // A container/folder node's own version can come back with a null locale (there's
-            // simply no locale concept for it, same gap noted in ProcessReferencedDependenciesAsync)
-            // -- forwarding that straight through 400s the create ("The 'locale' field does not
-            // allow 'null' values"), which then cascades into every child that needs this container
-            // as its parent failing with "Unable to find a content item with the key" since it was
-            // never actually created. Fall back to the locale of whatever's transferring THIS
-            // container, same as the main content-write path does.
-            var locale = string.IsNullOrEmpty(v.Locale) ? fallbackLocale : v.Locale;
+            // A container/folder node's own version can come back with a null locale. Two DISTINCT
+            // reasons this happens, needing OPPOSITE fixes, and no way to tell them apart up front:
+            //   1. A genuinely non-localized content type (e.g. a plain system folder) -- the target
+            //      REJECTS an explicit locale outright: "A locale should not be provided when
+            //      creating content of a non-localized content type." Confirmed live.
+            //   2. A localized type whose particular version just has no locale set (there's simply
+            //      no locale concept exercised for it) -- the target requires ONE: "The 'locale'
+            //      field does not allow 'null' values." Also confirmed live.
+            // So: omit locale entirely when the source didn't have one (case 1, the more common
+            // shape for structural containers/folders), and only add a fallback locale on a retry if
+            // the target says one was actually required after all (case 2) -- rather than always
+            // forcing a fallback in up front, which 400s case 1 the opposite way.
             createJson["initialVersion"] = new JsonObject
             {
                 ["displayName"] = v.DisplayName,
-                ["locale"] = locale,
                 ["properties"] = JsonNode.Parse(v.PropertiesJson)
             };
+            SetIfNotNull((JsonObject)createJson["initialVersion"], "locale", v.Locale);
         }
 
         try
         {
             var targetToken = await _tokenService.GetTokenAsync(target);
             var resp = await _api.CreateContentAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), "create missing container");
+
+            if (!resp.IsSuccess && resp.Status == HttpStatusCode.BadRequest
+                && createJson["initialVersion"] is JsonObject iv && iv["locale"] == null
+                && !string.IsNullOrEmpty(fallbackLocale)
+                && HasErrorForField(resp.Body, "initialVersion.locale"))
+            {
+                _logger.LogDebug("Container {Guid} needs a locale after all — retrying with fallback '{Locale}': {Body}", containerGuid, fallbackLocale, resp.Body);
+                iv["locale"] = fallbackLocale;
+                targetToken = await _tokenService.GetTokenAsync(target);
+                resp = await _api.CreateContentAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), "create missing container (with fallback locale)");
+            }
+
             if (!resp.IsSuccess && resp.Status != HttpStatusCode.Conflict)
                 _logger.LogWarning("Could not create missing container {Guid} on target: HTTP {Status}: {Body}", containerGuid, (int)resp.Status, resp.Body);
             else
@@ -1645,6 +1661,23 @@ public class ContentTransferService : IContentTransferService
     // — e.g. {"errors":[{"field":"initialVersion.properties.Heading","detail":"..."}]} or
     // {"field":"properties.Image", ...} for a version write. Much simpler than CMA's message-
     // string regex matching: the new API always names the exact field.
+    // Exact-match version of the field-path check ExtractOffendingField does for "properties.X"
+    // paths, for a top-level field like "initialVersion.locale" that isn't under "properties" at
+    // all and so never matches that helper's "properties." anchor.
+    private static bool HasErrorForField(string errorBody, string exactField)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(errorBody);
+            if (!doc.RootElement.TryGetProperty("errors", out var errors) || errors.ValueKind != JsonValueKind.Array) return false;
+            foreach (var err in errors.EnumerateArray())
+                if (err.TryGetProperty("field", out var f) && f.ValueKind == JsonValueKind.String && f.GetString() == exactField)
+                    return true;
+        }
+        catch { }
+        return false;
+    }
+
     private static (string PropertyName, int? ArrayIndex) ExtractOffendingField(string errorBody)
     {
         try
