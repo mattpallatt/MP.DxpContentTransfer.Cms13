@@ -5,12 +5,18 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>MP.DxpContentTransfer.Cms13</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>Matt Pallatt</Authors>
     <Description>An Optimizely CMS 13 gadget that lets content editors push content (pages, blocks, images, etc.) between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar with no developer involvement required.</Description>
-    <ProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</ProjectUrl>
-    <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</RepositoryUrl>
+    <!--
+      Points at THIS repo, not the sibling MP.DxpContentTransfer (the CMA/CDAPI-based CMS 12
+      original this was forked from): the package metadata had been carrying the sibling's URL
+      since the fork, pointing consumers at the wrong project entirely.
+    -->
+    <PackageProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer.Cms13</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer.Cms13</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
 
     <!--
       Ships wwwroot/DxpContentTransfer.Cms13/module.config as an ASP.NET Core static web asset.
@@ -39,5 +45,9 @@
     <PackageReference Include="EPiServer.CMS.Core" Version="[13.0.0, 14.0.0)" />
     <PackageReference Include="EPiServer.CMS.UI.Core" Version="[13.0.0, 14.0.0)" />
     <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>
