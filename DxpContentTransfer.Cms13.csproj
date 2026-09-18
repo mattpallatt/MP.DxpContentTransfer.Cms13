@@ -11,6 +11,28 @@
     <ProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</ProjectUrl>
     <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+
+    <!--
+      Ships wwwroot/DxpContentTransfer.Cms13/module.config as an ASP.NET Core static web asset.
+      Razor Class Libraries namespace their static assets under "_content/{library}" by default
+      (to avoid collisions between libraries) — that default would NOT satisfy
+      EPiServer.Shell.Modules.ModuleFinder, which looks for a manifest at
+      "{ProtectedModuleOptions.RootPath}{ModuleName}" (RootPath defaults to "~/ui"). Overriding
+      the base path to "ui" makes the file resolve at "/ui/DxpContentTransfer.Cms13/module.config"
+      instead — exactly where a plain `dotnet add package` consumer's default RootPath expects
+      it, with zero manual setup. This is served automatically by any consuming app that calls
+      UseStaticFiles()/MapStaticAssets() (true of any real ASP.NET Core CMS host), both from a
+      ProjectReference during local `dotnet run` and from a published/deployed PackageReference.
+
+      This does NOT cover a consuming app that reconfigures ProtectedModuleOptions.RootPath away
+      from the default (e.g. Jhoose.Security, which remaps it to "~/Optimizely") — that case has
+      no single physical location that works for everyone, so it still needs a hand-placed
+      module.config at "{their RootPath}/DxpContentTransfer.Cms13/module.config", same as this
+      repo's own CMS13 test host does for exactly that reason (see its
+      Optimizely/DxpContentTransfer.Cms13/module.config). See CLAUDE.md and
+      Extensions/ServiceCollectionExtensions.cs for the full explanation.
+    -->
+    <StaticWebAssetBasePath>ui</StaticWebAssetBasePath>
   </PropertyGroup>
 
   <ItemGroup>

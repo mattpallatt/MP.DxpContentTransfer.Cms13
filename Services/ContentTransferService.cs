@@ -193,9 +193,15 @@ public class ContentTransferService : IContentTransferService
                     if (culture != null && !string.IsNullOrEmpty(culture.Name))
                         availableLanguages[culture.Name] = culture.EnglishName;
 
-        // All IContentLoader work done — now safe to await.
-        string targetToken;
-        try { targetToken = await _tokenService.GetTokenAsync(target); }
+        // All IContentLoader work done — now safe to await. This is just an up-front auth
+        // sanity check (fail fast with a friendly error on bad credentials) — the token itself
+        // is NOT threaded through the loop below. See BuildPreCheckItemAsync/ExistsOnTargetAsync/
+        // ResolveTargetParentAsync: each fetches its own token from IEnvironmentTokenService right
+        // before use instead. GetTokenAsync caches per environment, so this costs nothing extra in
+        // the common case, but it means a token that goes stale partway through a long pre-check
+        // (large trees; the new API's tokens are short-lived, 300s) gets silently refreshed on the
+        // next call instead of every subsequent request 401ing for the rest of the run.
+        try { await _tokenService.GetTokenAsync(target); }
         catch (Exception ex) { return new PreCheckResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
 
         var result = new PreCheckResult
@@ -219,7 +225,7 @@ public class ContentTransferService : IContentTransferService
                 itemRef, content,
                 directParentSourceGuid, directParentName, ancestorsWithUrls,
                 siteRootGuid, siteRootPath,
-                target, targetToken, overwriteMatchingIds, batchGuidMap, batchForcedNew,
+                target, overwriteMatchingIds, batchGuidMap, batchForcedNew,
                 idx == 0 ? destinationOverrideGuid : null, idx == 0 ? destinationParentName : null);
 
             item.Dependencies = deps;
@@ -385,7 +391,6 @@ public class ContentTransferService : IContentTransferService
         Guid? siteRootGuid,
         string siteRootPath,
         DxpEnvironmentConfig target,
-        string targetToken,
         bool overwriteMatchingIds,
         Dictionary<Guid, Guid> batchGuidMap,
         HashSet<Guid> batchForcedNew,
@@ -398,7 +403,7 @@ public class ContentTransferService : IContentTransferService
         var guid = content.ContentGuid;
         var name = content.Name;
 
-        var existsOnTarget = await ExistsOnTargetAsync(guid, target, targetToken);
+        var existsOnTarget = await ExistsOnTargetAsync(guid, target);
 
         if (existsOnTarget && directParentSourceGuid.HasValue && batchForcedNew.Contains(directParentSourceGuid.Value))
             existsOnTarget = false;
@@ -427,7 +432,7 @@ public class ContentTransferService : IContentTransferService
         }
         else
         {
-            (parentGuid, parentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
+            (parentGuid, parentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target);
         }
 
         var isRootFallback = false;
@@ -463,8 +468,14 @@ public class ContentTransferService : IContentTransferService
         };
     }
 
-    private async Task<bool> ExistsOnTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
+    // Fetches its own token rather than taking one as a parameter — GetTokenAsync caches per
+    // environment (near-free on the hot path) and transparently returns a freshly-reissued token
+    // once the cached one is near/past its (short, 300s) expiry. This is what makes a long-running
+    // transfer self-heal instead of every call 401ing for the rest of the job once the token
+    // acquired at the start of PreCheck/Transfer goes stale — see CLAUDE.md / EnvironmentTokenService.
+    private async Task<bool> ExistsOnTargetAsync(Guid guid, DxpEnvironmentConfig target)
     {
+        var targetToken = await _tokenService.GetTokenAsync(target);
         var r = await _api.GetNodeAsync(target.BaseUrl, targetToken, ToKey(guid), "exists check");
         // 401/403 means the content EXISTS but our identity can't read it — treat as present.
         if (r.Status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return true;
@@ -482,12 +493,12 @@ public class ContentTransferService : IContentTransferService
     // in instead of a URL match — content still gets created (under site root, unpublished)
     // rather than silently lost, just not under the "right" pre-existing parent.
     private async Task<(Guid? guid, string path)> ResolveTargetParentAsync(
-        List<(IContent ancestor, string url)> ancestorsWithUrls, DxpEnvironmentConfig target, string targetToken)
+        List<(IContent ancestor, string url)> ancestorsWithUrls, DxpEnvironmentConfig target)
     {
         foreach (var (ancestor, _) in ancestorsWithUrls)
         {
             if (ancestor.ContentGuid == Guid.Empty) continue;
-            if (await ExistsOnTargetAsync(ancestor.ContentGuid, target, targetToken))
+            if (await ExistsOnTargetAsync(ancestor.ContentGuid, target))
                 return (ancestor.ContentGuid, ancestor.Name);
         }
         return (null, null);
@@ -558,6 +569,10 @@ public class ContentTransferService : IContentTransferService
 
         var rootKey = ToKey(siteRootGuid.Value);
         var rootNodeResp = await _api.GetNodeAsync(target.BaseUrl, targetToken, rootKey, "resolve destination tree root");
+        // Below this point `target` (not the token fetched above) is threaded through the whole
+        // tree preload — each helper re-fetches its own (cached) token right before use, same
+        // reasoning as ExistsOnTargetAsync, so a token that goes stale partway through a big/deep
+        // site's tree preload gets silently refreshed instead of the rest of the walk 401ing.
         if (!rootNodeResp.IsSuccess)
             return new DestinationTreeRootResult { Success = false, ErrorMessage = $"Site root does not exist on target yet: HTTP {(int)rootNodeResp.Status}" };
 
@@ -578,11 +593,11 @@ public class ContentTransferService : IContentTransferService
         {
             Success = true,
             RootKey = rootKey,
-            RootName = await ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, rootKey, defaultLocale) ?? siteRootPath,
+            RootName = await ResolveChildDisplayNameAsync(target, rootKey, defaultLocale) ?? siteRootPath,
             DefaultLocale = defaultLocale
         };
 
-        var (defaultParentGuid, defaultParentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
+        var (defaultParentGuid, defaultParentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target);
         if (defaultParentGuid.HasValue)
         {
             // BUG FIX: ResolveTargetParentAsync returns the SOURCE ancestor's own name (it's built
@@ -596,8 +611,8 @@ public class ContentTransferService : IContentTransferService
             // whatever the tree itself displays for that key.
             var defaultParentKey = ToKey(defaultParentGuid.Value);
             result.DefaultParentKey = defaultParentKey;
-            result.DefaultParentName = await ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, defaultParentKey, defaultLocale) ?? defaultParentPath;
-            result.ExpandPath = await BuildDestinationExpandPathAsync(target, targetToken, defaultParentGuid.Value, rootKey);
+            result.DefaultParentName = await ResolveChildDisplayNameAsync(target, defaultParentKey, defaultLocale) ?? defaultParentPath;
+            result.ExpandPath = await BuildDestinationExpandPathAsync(target, defaultParentGuid.Value, rootKey);
         }
         else
         {
@@ -616,7 +631,7 @@ public class ContentTransferService : IContentTransferService
         // requests; ListDestinationChildrenAsync (the old per-level endpoint) is left in place for a
         // future hybrid fallback if that cap ever needs to matter in practice.
         var budget = new TreeBudget { Remaining = MaxDestinationTreeNodes };
-        var children = await BuildDestinationSubtreeAsync(target, targetToken, rootKey, defaultLocale, 1, budget);
+        var children = await BuildDestinationSubtreeAsync(target, rootKey, defaultLocale, 1, budget);
         result.Tree = new DestinationTreeNode { Key = rootKey, Name = result.RootName, Children = children };
         result.Truncated = budget.Remaining <= 0;
 
@@ -633,10 +648,11 @@ public class ContentTransferService : IContentTransferService
     // walk (concurrent branches decrement it concurrently) so the total node count across the ENTIRE
     // tree stays bounded, not just per-level.
     private async Task<List<DestinationTreeNode>> BuildDestinationSubtreeAsync(
-        DxpEnvironmentConfig target, string targetToken, string containerKey, string locale, int depth, TreeBudget budget)
+        DxpEnvironmentConfig target, string containerKey, string locale, int depth, TreeBudget budget)
     {
         if (depth > 20 || budget.Remaining <= 0) return new List<DestinationTreeNode>();
 
+        var targetToken = await _tokenService.GetTokenAsync(target);
         var itemsResp = await _api.ListItemsAsync(target.BaseUrl, targetToken, containerKey, "preload destination tree");
         if (!itemsResp.IsSuccess) return new List<DestinationTreeNode>();
 
@@ -648,11 +664,11 @@ public class ContentTransferService : IContentTransferService
         }
         if (nodes.Count == 0) return nodes;
 
-        var names = await Task.WhenAll(nodes.Select(n => ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, n.Key, locale)));
+        var names = await Task.WhenAll(nodes.Select(n => ResolveChildDisplayNameAsync(target, n.Key, locale)));
         for (var i = 0; i < nodes.Count; i++)
             nodes[i].Name = names[i] ?? nodes[i].Key;
 
-        var childSubtrees = await Task.WhenAll(nodes.Select(n => BuildDestinationSubtreeAsync(target, targetToken, n.Key, locale, depth + 1, budget)));
+        var childSubtrees = await Task.WhenAll(nodes.Select(n => BuildDestinationSubtreeAsync(target, n.Key, locale, depth + 1, budget)));
         for (var i = 0; i < nodes.Count; i++)
             nodes[i].Children = childSubtrees[i];
 
@@ -662,7 +678,7 @@ public class ContentTransferService : IContentTransferService
     // Root-first chain of keys from the tree root down to (and including) targetGuid, by walking
     // `container` back from targetGuid on the TARGET side. Lets the client auto-expand every
     // ancestor of the predicted location in one shot instead of the editor clicking through each.
-    private async Task<List<string>> BuildDestinationExpandPathAsync(DxpEnvironmentConfig target, string targetToken, Guid targetGuid, string rootKey)
+    private async Task<List<string>> BuildDestinationExpandPathAsync(DxpEnvironmentConfig target, Guid targetGuid, string rootKey)
     {
         var chain = new List<string>();
         var currentKey = ToKey(targetGuid);
@@ -671,6 +687,7 @@ public class ContentTransferService : IContentTransferService
         {
             chain.Add(currentKey);
             if (string.Equals(currentKey, rootKey, StringComparison.OrdinalIgnoreCase)) break;
+            var targetToken = await _tokenService.GetTokenAsync(target);
             var nodeResp = await _api.GetNodeAsync(target.BaseUrl, targetToken, currentKey, "walk destination ancestor chain");
             if (!nodeResp.IsSuccess || !TryExtractStringField(nodeResp.Body, "container", out var containerKey)) break;
             currentKey = containerKey;
@@ -695,7 +712,7 @@ public class ContentTransferService : IContentTransferService
             return new DestinationTreeChildrenResult { Success = false, ErrorMessage = $"Could not list children: HTTP {(int)itemsResp.Status}: {itemsResp.Body}" };
 
         var childKeys = ExtractItemKeys(itemsResp.Body);
-        var names = await Task.WhenAll(childKeys.Select(k => ResolveChildDisplayNameAsync(target.BaseUrl, targetToken, k, locale)));
+        var names = await Task.WhenAll(childKeys.Select(k => ResolveChildDisplayNameAsync(target, k, locale)));
 
         var children = new List<DestinationTreeNode>();
         for (var i = 0; i < childKeys.Count; i++)
@@ -712,11 +729,12 @@ public class ContentTransferService : IContentTransferService
     // back to the unfiltered first version if the node has no version in that locale at all (e.g. a
     // page that was only ever translated into other languages), so a name still shows rather than
     // nothing.
-    private async Task<string> ResolveChildDisplayNameAsync(string baseUrl, string token, string key, string locale)
+    private async Task<string> ResolveChildDisplayNameAsync(DxpEnvironmentConfig target, string key, string locale)
     {
+        var token = await _tokenService.GetTokenAsync(target);
         if (!string.IsNullOrEmpty(locale))
         {
-            var filtered = await _api.ListVersionsAsync(baseUrl, token, key, "resolve destination tree node name", locale);
+            var filtered = await _api.ListVersionsAsync(target.BaseUrl, token, key, "resolve destination tree node name", locale);
             if (filtered.IsSuccess)
             {
                 var filteredVersions = ParseVersionList(filtered.Body);
@@ -724,7 +742,7 @@ public class ContentTransferService : IContentTransferService
             }
         }
 
-        var resp = await _api.ListVersionsAsync(baseUrl, token, key, "resolve destination tree node name (fallback — no version in default locale)");
+        var resp = await _api.ListVersionsAsync(target.BaseUrl, token, key, "resolve destination tree node name (fallback — no version in default locale)");
         if (!resp.IsSuccess) return null;
         var versions = ParseVersionList(resp.Body);
         return versions.Count > 0 ? versions[0].DisplayName : null;
@@ -798,13 +816,17 @@ public class ContentTransferService : IContentTransferService
             })
             .ToList();
 
-        // All IContentLoader work done — now safe to await.
-        string targetToken;
-        try { targetToken = await _tokenService.GetTokenAsync(target); }
+        // All IContentLoader work done — now safe to await. As with PreCheckAsync, these are just
+        // up-front auth sanity checks — a transfer can take far longer than the new API's 300s
+        // token lifetime for a large tree, so the tokens fetched here are deliberately NOT threaded
+        // through the transfer below. Every call site down in TransferSingleItemAsync/
+        // TransferItemCoreAsync/etc. re-fetches its own (cached) token from IEnvironmentTokenService
+        // right before use instead, so a token going stale mid-transfer is silently reissued rather
+        // than 401ing every subsequent request for the rest of the job.
+        try { await _tokenService.GetTokenAsync(target); }
         catch (Exception ex) { return new TransferResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
 
-        string sourceToken;
-        try { sourceToken = await _tokenService.GetTokenAsync(source); }
+        try { await _tokenService.GetTokenAsync(source); }
         catch (Exception ex) { return new TransferResult { Success = false, ErrorMessage = $"Failed to authenticate with source environment: {ex.Message}" }; }
 
         var planLookup = plan?.ToDictionary(p => p.ContentId, StringComparer.OrdinalIgnoreCase) ?? new Dictionary<string, PreCheckItemResult>();
@@ -816,7 +838,7 @@ public class ContentTransferService : IContentTransferService
             planLookup.TryGetValue(ctx.itemRef.ToString(), out var planItem);
             var itemResult = await TransferSingleItemAsync(
                 ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid, ctx.ancestorsWithUrls,
-                source.BaseUrl, sourceToken, target, targetToken,
+                source, target,
                 planItem, transferStatus, onItemComplete, languageFilter);
             result.Items.Add(itemResult);
             if (!itemResult.Success) result.Success = false;
@@ -829,7 +851,7 @@ public class ContentTransferService : IContentTransferService
     private async Task<TransferItemResult> TransferSingleItemAsync(
         ContentReference contentRef, IContent content, string contentName, Guid sourceGuid,
         List<(IContent ancestor, string url)> ancestorsWithUrls,
-        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        DxpEnvironmentConfig source, DxpEnvironmentConfig target,
         PreCheckItemResult planItem, string transferStatus, Action onItemComplete, HashSet<string> languageFilter)
     {
         if (content == null)
@@ -844,12 +866,13 @@ public class ContentTransferService : IContentTransferService
         {
             // Overwrite: item already exists — keep its current container/owner on target rather
             // than re-deriving one, exactly as the CMA-era engine did.
+            var targetToken = await _tokenService.GetTokenAsync(target);
             var existingNode = await _api.GetNodeAsync(target.BaseUrl, targetToken, ToKey(sourceGuid), "read existing target parent");
             targetParentGuid = existingNode.IsSuccess ? (ExtractGuidField(existingNode.Body, "container") ?? ExtractGuidField(existingNode.Body, "owner") ?? Guid.Empty) : Guid.Empty;
         }
         else
         {
-            var (parentGuid, _) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
+            var (parentGuid, _) = await ResolveTargetParentAsync(ancestorsWithUrls, target);
             targetParentGuid = parentGuid ?? Guid.Empty;
         }
 
@@ -859,7 +882,7 @@ public class ContentTransferService : IContentTransferService
         try
         {
             var effectiveStatus = transferStatus == "CheckedOut" ? "CheckedOut" : "Published";
-            await TransferItemCoreAsync(sourceGuid, sourceBaseUrl, sourceToken, target, targetToken,
+            await TransferItemCoreAsync(sourceGuid, source, target,
                 targetGuid, targetParentGuid, effectiveStatus, visited, onItemComplete, failedDependencyGuids, languageFilter);
 
             return new TransferItemResult
@@ -890,13 +913,19 @@ public class ContentTransferService : IContentTransferService
     //   5. Write every OTHER language this item has (subject to languageFilter) as an additional
     //      version, same properties-copy logic, no shared/invariant filtering needed.
     private async Task TransferItemCoreAsync(
-        Guid sourceGuid, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        Guid sourceGuid, DxpEnvironmentConfig source, DxpEnvironmentConfig target,
         Guid targetGuid, Guid targetParentGuid, string effectiveStatus,
         HashSet<Guid> visited, Action onItemComplete, List<string> failedDependencyGuids, HashSet<string> languageFilter,
         string fallbackLocale = null)
     {
+        // Tokens are fetched fresh (from IEnvironmentTokenService's cache) at each point of use
+        // throughout this method and everything it calls, rather than once up front — a deep/wide
+        // transfer can run well past the new API's 300s token lifetime, and a token fetched once at
+        // the start of TransferAsync would otherwise go stale partway through and 401 every
+        // subsequent call for the rest of the job. See CLAUDE.md / EnvironmentTokenService.
         var sourceKey = ToKey(sourceGuid);
-        var nodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, sourceKey, "read source node");
+        var sourceToken = await _tokenService.GetTokenAsync(source);
+        var nodeResp = await _api.GetNodeAsync(source.BaseUrl, sourceToken, sourceKey, "read source node");
         if (!nodeResp.IsSuccess)
             throw new HttpRequestException($"Could not read source node {sourceKey}: HTTP {(int)nodeResp.Status}: {nodeResp.Body}");
 
@@ -905,7 +934,8 @@ public class ContentTransferService : IContentTransferService
         var isContained = !isOwned && !string.IsNullOrEmpty(sourceContainerKey);
         var contentType = ExtractStringField(nodeResp.Body, "contentType");
 
-        var versionsResp = await _api.ListVersionsAsync(sourceBaseUrl, sourceToken, sourceKey, "read source versions");
+        sourceToken = await _tokenService.GetTokenAsync(source);
+        var versionsResp = await _api.ListVersionsAsync(source.BaseUrl, sourceToken, sourceKey, "read source versions");
         if (!versionsResp.IsSuccess)
             throw new HttpRequestException($"Could not read source versions for {sourceKey}: HTTP {(int)versionsResp.Status}: {versionsResp.Body}");
 
@@ -914,7 +944,7 @@ public class ContentTransferService : IContentTransferService
         {
             // No versions at all — a non-versionable container/folder. Just ensure it (and its
             // container chain) exists on target under the same key; nothing to write.
-            await EnsureContainerExistsAsync(targetGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid>());
+            await EnsureContainerExistsAsync(targetGuid, source, target, new HashSet<Guid>());
             onItemComplete?.Invoke();
             return;
         }
@@ -939,7 +969,7 @@ public class ContentTransferService : IContentTransferService
         // ── Step 1: transfer referenced dependencies depth-first ──────────────
         var isMedia = IsMediaContentType(contentType);
         if (!isMedia)
-            await ProcessReferencedDependenciesAsync(masterVersion.PropertiesJson, sourceBaseUrl, sourceToken, target, targetToken, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
+            await ProcessReferencedDependenciesAsync(masterVersion.PropertiesJson, source, target, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
 
         // BUG FIX: an existing media item has nothing meaningful left to do — key preservation
         // already guarantees its binary is correct (it was uploaded once, under this same key, the
@@ -950,7 +980,7 @@ public class ContentTransferService : IContentTransferService
         // been transferred in an earlier run threw a genuine HTTP 400 on every subsequent transfer
         // of the page that referenced it, even though the asset was already present and fine on
         // target, and got reported to the editor as a hard failure for something that wasn't broken.
-        if (isMedia && await ExistsOnTargetAsync(targetGuid, target, targetToken))
+        if (isMedia && await ExistsOnTargetAsync(targetGuid, target))
         {
             onItemComplete?.Invoke();
             return;
@@ -988,7 +1018,7 @@ public class ContentTransferService : IContentTransferService
         {
             // A dependency (block/media, or a top-level item with no resolvable parent at all) —
             // mirror its source container/folder chain, creating any missing link under the same key.
-            await EnsureContainerExistsAsync(containerGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { sourceGuid });
+            await EnsureContainerExistsAsync(containerGuid, source, target, new HashSet<Guid> { sourceGuid });
             effectiveParent = containerGuid;
             useOwner = false;
         }
@@ -999,10 +1029,10 @@ public class ContentTransferService : IContentTransferService
         }
 
         // ── Step 3: create or add-version on target for the default locale ────
-        var exists = await ExistsOnTargetAsync(targetGuid, target, targetToken);
+        var exists = await ExistsOnTargetAsync(targetGuid, target);
         await WriteContentVersionAsync(
             targetGuid, exists, contentType, useOwner, effectiveParent, masterVersion,
-            sourceBaseUrl, sourceToken, target, targetToken, effectiveStatus, isMedia, failedDependencyGuids);
+            source, target, effectiveStatus, isMedia, failedDependencyGuids);
 
         // ── Step 4: every other language ───────────────────────────────────────
         foreach (var version in versions)
@@ -1013,13 +1043,13 @@ public class ContentTransferService : IContentTransferService
             // A branch can reference dependencies the master pass never saw (e.g. a block only
             // used in a culture-specific ContentArea) — walk it too.
             if (!isMedia)
-                await ProcessReferencedDependenciesAsync(version.PropertiesJson, sourceBaseUrl, sourceToken, target, targetToken, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
+                await ProcessReferencedDependenciesAsync(version.PropertiesJson, source, target, visited, onItemComplete, failedDependencyGuids, languageFilter, defaultLocale);
 
             try
             {
                 await WriteContentVersionAsync(
                     targetGuid, true, contentType, useOwner, effectiveParent, version,
-                    sourceBaseUrl, sourceToken, target, targetToken, effectiveStatus, isMedia, failedDependencyGuids);
+                    source, target, effectiveStatus, isMedia, failedDependencyGuids);
             }
             catch (Exception ex)
             {
@@ -1036,7 +1066,7 @@ public class ContentTransferService : IContentTransferService
     // the CMA-era engine's behaviour). `visited` dedups across the whole item transfer, including
     // branches, so a dependency shared by several languages is only actually written once.
     private async Task ProcessReferencedDependenciesAsync(
-        string propertiesJson, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        string propertiesJson, DxpEnvironmentConfig source, DxpEnvironmentConfig target,
         HashSet<Guid> visited, Action onItemComplete, List<string> failedDependencyGuids, HashSet<string> languageFilter,
         string fallbackLocale)
     {
@@ -1063,7 +1093,8 @@ public class ContentTransferService : IContentTransferService
             if (!visited.Add(refGuid)) continue;
 
             var refKey = ToKey(refGuid);
-            var refNodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, refKey, "read referenced source node");
+            var sourceToken = await _tokenService.GetTokenAsync(source);
+            var refNodeResp = await _api.GetNodeAsync(source.BaseUrl, sourceToken, refKey, "read referenced source node");
             if (!refNodeResp.IsSuccess) { visited.Remove(refGuid); continue; }
 
             var refContentType = ExtractStringField(refNodeResp.Body, "contentType");
@@ -1073,7 +1104,7 @@ public class ContentTransferService : IContentTransferService
 
             try
             {
-                await TransferItemCoreAsync(refGuid, sourceBaseUrl, sourceToken, target, targetToken,
+                await TransferItemCoreAsync(refGuid, source, target,
                     refGuid, Guid.Empty, "Published", visited, onItemComplete, failedDependencyGuids, languageFilter, fallbackLocale);
             }
             catch (Exception ex)
@@ -1090,13 +1121,14 @@ public class ContentTransferService : IContentTransferService
     // engine's URL-based EnsureGlobalAssetFolderPathAsync/EnsureContentParentAsync entirely — no
     // URL resolution needed at all when the target key is always known in advance.
     private async Task EnsureContainerExistsAsync(
-        Guid containerGuid, string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken, HashSet<Guid> seen)
+        Guid containerGuid, DxpEnvironmentConfig source, DxpEnvironmentConfig target, HashSet<Guid> seen)
     {
         if (!seen.Add(containerGuid)) return;
-        if (await ExistsOnTargetAsync(containerGuid, target, targetToken)) return;
+        if (await ExistsOnTargetAsync(containerGuid, target)) return;
 
         var key = ToKey(containerGuid);
-        var nodeResp = await _api.GetNodeAsync(sourceBaseUrl, sourceToken, key, "read missing container");
+        var sourceToken = await _tokenService.GetTokenAsync(source);
+        var nodeResp = await _api.GetNodeAsync(source.BaseUrl, sourceToken, key, "read missing container");
         if (!nodeResp.IsSuccess)
         {
             _logger.LogWarning("Could not read missing container {Guid} from source: HTTP {Status}", containerGuid, (int)nodeResp.Status);
@@ -1106,7 +1138,7 @@ public class ContentTransferService : IContentTransferService
         var contentType = ExtractStringField(nodeResp.Body, "contentType");
         Guid? grandparentGuid = TryExtractStringField(nodeResp.Body, "container", out var gp) && Guid.TryParseExact(gp, "N", out var gpg) ? gpg : null;
         if (grandparentGuid.HasValue && grandparentGuid.Value != Guid.Empty)
-            await EnsureContainerExistsAsync(grandparentGuid.Value, sourceBaseUrl, sourceToken, target, targetToken, seen);
+            await EnsureContainerExistsAsync(grandparentGuid.Value, source, target, seen);
 
         // KNOWN GAP: if this container has no container/owner of its own (a true root-level
         // container, e.g. the site root itself), it can't be created via this path at all —
@@ -1119,7 +1151,8 @@ public class ContentTransferService : IContentTransferService
             return;
         }
 
-        var versionsResp = await _api.ListVersionsAsync(sourceBaseUrl, sourceToken, key, "read missing container versions");
+        sourceToken = await _tokenService.GetTokenAsync(source);
+        var versionsResp = await _api.ListVersionsAsync(source.BaseUrl, sourceToken, key, "read missing container versions");
         var versions = versionsResp.IsSuccess ? ParseVersionList(versionsResp.Body) : new List<SourceVersion>();
 
         var createJson = new JsonObject
@@ -1141,6 +1174,7 @@ public class ContentTransferService : IContentTransferService
 
         try
         {
+            var targetToken = await _tokenService.GetTokenAsync(target);
             var resp = await _api.CreateContentAsync(target.BaseUrl, targetToken, createJson.ToJsonString(), "create missing container");
             if (!resp.IsSuccess && resp.Status != HttpStatusCode.Conflict)
                 _logger.LogWarning("Could not create missing container {Guid} on target: HTTP {Status}: {Body}", containerGuid, (int)resp.Status, resp.Body);
@@ -1158,7 +1192,7 @@ public class ContentTransferService : IContentTransferService
     // rewriting, and the bounded strip-and-retry loop for properties the target rejects.
     private async Task WriteContentVersionAsync(
         Guid targetGuid, bool targetExists, string contentType, bool useOwner, Guid parentGuid, SourceVersion version,
-        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        DxpEnvironmentConfig source, DxpEnvironmentConfig target,
         string effectiveStatus, bool isMedia, List<string> failedDependencyGuids)
     {
         var key = ToKey(targetGuid);
@@ -1171,11 +1205,15 @@ public class ContentTransferService : IContentTransferService
         string mediaFileName = null, mediaMimeType = null;
         if (isMedia && !targetExists)
         {
-            (mediaBytes, mediaFileName, mediaMimeType) = await DownloadMediaAsync(sourceBaseUrl, sourceToken, ToKey(ToGuid(key)), version);
+            (mediaBytes, mediaFileName, mediaMimeType) = await DownloadMediaAsync(source, ToKey(ToGuid(key)), version);
         }
 
         for (var attempt = 0; attempt < MaxWriteAttempts; attempt++)
         {
+            // Fetched fresh each attempt (cached, near-free) rather than once before the loop — a
+            // bounded strip-and-retry loop is normally fast, but this keeps the write self-healing
+            // even in the rare case a token expires mid-retry.
+            var targetToken = await _tokenService.GetTokenAsync(target);
             CmsApiResponse resp;
             if (!targetExists)
             {
@@ -1214,7 +1252,7 @@ public class ContentTransferService : IContentTransferService
             if (resp.IsSuccess)
             {
                 if (effectiveStatus == "Published")
-                    await PublishLatestVersionAsync(target.BaseUrl, targetToken, key, version.Locale);
+                    await PublishLatestVersionAsync(target, key, version.Locale);
                 return;
             }
 
@@ -1291,9 +1329,10 @@ public class ContentTransferService : IContentTransferService
     // content_createversion return differently-shaped bodies (NewContentNode vs. bare
     // ContentVersion) — listing is uniform for both and avoids guessing at which shape applies.
     // The highest version number for the locale is the one just written (versions only increase).
-    private async Task PublishLatestVersionAsync(string baseUrl, string token, string key, string locale)
+    private async Task PublishLatestVersionAsync(DxpEnvironmentConfig target, string key, string locale)
     {
-        var resp = await _api.ListVersionsAsync(baseUrl, token, key, "find version to publish", locale);
+        var token = await _tokenService.GetTokenAsync(target);
+        var resp = await _api.ListVersionsAsync(target.BaseUrl, token, key, "find version to publish", locale);
         if (!resp.IsSuccess) return;
         var candidates = ParseVersionList(resp.Body)
             .Where(v => string.Equals(v.Locale, locale, StringComparison.OrdinalIgnoreCase))
@@ -1301,16 +1340,18 @@ public class ContentTransferService : IContentTransferService
         if (candidates.Count == 0) return;
         var latest = candidates.OrderByDescending(v => int.TryParse(v.VersionNumber, out var n) ? n : 0).First();
 
-        var pubResp = await _api.PublishVersionAsync(baseUrl, token, key, latest.VersionNumber, "publish version");
+        token = await _tokenService.GetTokenAsync(target);
+        var pubResp = await _api.PublishVersionAsync(target.BaseUrl, token, key, latest.VersionNumber, "publish version");
         if (!pubResp.IsSuccess)
             _logger.LogWarning("Could not publish version {Version} of {Key}: HTTP {Status}: {Body}", latest.VersionNumber, key, (int)pubResp.Status, pubResp.Body);
     }
 
-    private async Task<(byte[] bytes, string fileName, string mimeType)> DownloadMediaAsync(string sourceBaseUrl, string sourceToken, string key, SourceVersion version)
+    private async Task<(byte[] bytes, string fileName, string mimeType)> DownloadMediaAsync(DxpEnvironmentConfig source, string key, SourceVersion version)
     {
         try
         {
-            var (status, bytes, contentType) = await _api.GetMediaBinaryAsync(sourceBaseUrl, sourceToken, key, version.VersionNumber, "download media");
+            var sourceToken = await _tokenService.GetTokenAsync(source);
+            var (status, bytes, contentType) = await _api.GetMediaBinaryAsync(source.BaseUrl, sourceToken, key, version.VersionNumber, "download media");
             if (status != HttpStatusCode.OK || bytes == null) return (null, null, null);
             var fileName = ResolveAssetFileName(version.DisplayName, version.RouteSegment, contentType);
             return (bytes, fileName, contentType ?? "application/octet-stream");

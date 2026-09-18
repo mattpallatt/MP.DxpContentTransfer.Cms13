@@ -117,6 +117,20 @@ API response bodies (not committed to the repo), not via an in-repo test project
   (`/api/episerver/connect/token`) — confirmed live, a token from one is flatly `401`'d by the
   other's API. Don't conflate them; an environment could plausibly have OpenIDConnect configured
   for something else entirely and still need a *different* `/_cms/v1` OAuth client set up here.
+  **`GetTokenAsync` is meant to be called again and again, right before each `/_cms/v1` request —
+  never once and threaded through as a fixed string.** `ContentTransferService` used to fetch a
+  single `targetToken`/`sourceToken` at the top of `PreCheckAsync`/`TransferAsync` and pass that
+  same string all the way down the recursive transfer walk. Since the new API's tokens only live
+  300s, any transfer that ran longer than that (a large/deep content tree easily can) would 401 on
+  every request for the rest of the job the moment the token expired, with nothing to recover it —
+  a real bug, confirmed reported. `GetTokenAsync` already caches per environment with a tight
+  safety margin, so calling it again is a cache hit in the overwhelming common case and a
+  transparent silent refresh right when it matters; the fix was to stop threading token *strings*
+  and thread the `DxpEnvironmentConfig` instead, fetching the actual token from
+  `IEnvironmentTokenService` immediately before every `CmsApiClient` call. If you add a new call
+  site that needs a token, follow that pattern — do not accept a pre-fetched token string as a
+  parameter and hold onto it across an `await` that could take a while (dependency transfers,
+  retry loops, tree walks).
 - `Services/EnvironmentHealthService` — the "Test connection" probe, ported to the new token
   endpoint/scope and a `GET /_cms/v1/content/{random-key}` probe (still "404 is success" — a
   healthy API 404s a non-existent key exactly like the old CMA probe did).
@@ -223,6 +237,30 @@ oversights discovered later. Each is also called out with a `KNOWN GAP` comment 
 
 ## CMS 13 shell integration — still-current notes from before the port (unaffected by it)
 
+- **`ModuleDetails` registration (`Extensions/ServiceCollectionExtensions.AddDxpContentTransfer`)
+  needs a physical `module.config` manifest to actually resolve — registering the name alone is
+  not enough.** `EPiServer.Shell.Modules.ModuleFinder` looks for a manifest on disk (or via a file
+  provider) at `{ProtectedModuleOptions.RootPath}DxpContentTransfer.Cms13` before the DI
+  registration does anything; if it can't find one, `DxpGadgetController`'s `[IFrameComponent]`
+  crashes the Edit UI dashboard for any signed-in editor with `ArgumentException: Unable to find a
+  module by assembly 'DxpContentTransfer.Cms13'` — confirmed live, cost hours to diagnose the first
+  time a plain `dotnet add package` install of this project hit it, because an unauthenticated
+  request never reaches the code path that throws. Fixed by shipping
+  `wwwroot/DxpContentTransfer.Cms13/module.config` as an ASP.NET Core **static web asset**, with
+  `<StaticWebAssetBasePath>ui</StaticWebAssetBasePath>` in the csproj overriding the Razor Class
+  Library default of namespacing under `_content/{library}` — that override is what makes the file
+  resolve at `/ui/DxpContentTransfer.Cms13/module.config`, matching
+  `ProtectedModuleOptions.RootPath`'s *default* value (`~/ui`) with zero manual setup, for both a
+  `ProjectReference` (this repo's own CMS13 test host) and a plain `PackageReference` into any
+  other ASP.NET Core CMS 13 app. **Known limitation, not fixed:** a host that reconfigures
+  `RootPath` away from the default (e.g. `Jhoose.Security`, which remaps every module's route base
+  to `~/Optimizely` for admin-URL obscurity — exactly what this repo's own CMS13 test host uses)
+  needs its own hand-placed `module.config` at `{their RootPath}/DxpContentTransfer.Cms13/
+  module.config` instead; there's no single physical location that satisfies every possible
+  override. See the CMS13 host's own `CMS13/Optimizely/DxpContentTransfer.Cms13/module.config` for
+  exactly that case, and the comment on `AddDxpContentTransfer()` for the full explanation. Also
+  note `loadFromBin="false"` in the shipped file matters — `"true"` makes `ModuleFinder` look for
+  the DLL under a nested `bin/` subfolder that doesn't exist in a normal consuming app.
 - **`Middleware/DxpAdminScriptMiddleware` was deleted** (this predates the REST API port). The
   sibling still uses this pattern for CMS 12 (inject an `AdminInit.js` `<script>` tag into admin
   HTML responses so the settings page can overlay the SPA via a hash route). CMS 13 doesn't need
